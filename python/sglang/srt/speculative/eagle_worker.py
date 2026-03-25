@@ -164,9 +164,6 @@ class EAGLEWorker(TpModelWorker):
                 memory_pool_config=target_worker.model_runner.memory_pool_config,
             )
 
-        # Restore attention backend so subsequent target-worker logic is unaffected.
-        server_args.attention_backend = backup_attention_backend
-
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
 
         if self.speculative_algorithm.is_eagle3():
@@ -216,6 +213,9 @@ class EAGLEWorker(TpModelWorker):
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
             self.init_attention_backend()
             self.init_cuda_graphs()
+
+        # Restore attention backend now that all draft initialization is complete.
+        server_args.attention_backend = backup_attention_backend
 
         # Some dummy tensors
         self.num_new_pages_per_topk = torch.empty(
