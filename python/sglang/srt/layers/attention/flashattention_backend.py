@@ -19,7 +19,9 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import get_compiler_backend
+from sglang.srt.utils import get_compiler_backend, is_hip as _is_hip_fn
+
+_is_hip = _is_hip_fn()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -3020,7 +3022,7 @@ def normal_decode_set_metadata(
         )
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_hip)
 def draft_decode_set_expand_metadata(
     cache_seqlens_int32: torch.Tensor,  # Modifies
     page_table: torch.Tensor,  # Modifies
