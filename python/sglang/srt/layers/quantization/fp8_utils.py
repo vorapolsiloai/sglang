@@ -76,17 +76,23 @@ def use_aiter_triton_gemm_w8a8_tuned_gfx950(n: int, k: int) -> bool:
     ]
 
 
-if _use_aiter:
-    import aiter
+if _use_aiter or _is_hip:
+    try:
+        import aiter
 
-    # from aiter import gemm_a8w8_blockscale, gemm_a8w8_bpreshuffle, get_hip_quant
-    from aiter import gemm_a8w8_blockscale as gemm_a8w8_blockscale
-    from aiter import gemm_a8w8_bpreshuffle, get_hip_quant
-    from aiter.ops.triton.gemm_a8w8_blockscale import (
-        gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale,
-    )
+        # from aiter import gemm_a8w8_blockscale, gemm_a8w8_bpreshuffle, get_hip_quant
+        from aiter import gemm_a8w8_blockscale as gemm_a8w8_blockscale
+        from aiter import gemm_a8w8_bpreshuffle, get_hip_quant
+        from aiter.ops.triton.gemm_a8w8_blockscale import (
+            gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale,
+        )
 
-    aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
+        aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
+        _aiter_linear_available = True
+    except Exception:
+        _aiter_linear_available = False
+else:
+    _aiter_linear_available = False
 
 
 if _is_cuda:
@@ -403,11 +409,10 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
         return cutlass_w8a8_block_fp8_linear_with_fallback
 
     elif backend.is_aiter():
-        if not _use_aiter:
+        if not _aiter_linear_available:
             raise RuntimeError(
                 "AITER backend requested via --fp8-gemm-backend=aiter, "
-                "but AITER is not available. AITER requires AMD GPUs with "
-                "SGLANG_USE_AITER=1 environment variable set."
+                "but aiter is not available. Install aiter for AMD ROCm."
             )
         return aiter_w8a8_block_fp8_linear
 
@@ -442,7 +447,7 @@ def _dispatch_auto_backend() -> Callable:
         return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
     elif _check_cutlass_block_fp8_hardware_support():
         return cutlass_w8a8_block_fp8_linear_with_fallback
-    elif _use_aiter:
+    elif _use_aiter and _aiter_linear_available:
         return aiter_w8a8_block_fp8_linear
     else:
         return triton_w8a8_block_fp8_linear

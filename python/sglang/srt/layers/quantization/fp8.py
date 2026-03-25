@@ -1733,40 +1733,47 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         if _use_aiter:
             assert not no_combine, f"{no_combine=} is not supported."
-            if self.block_quant:
-                return fused_moe(
-                    x,
-                    layer.w13_weight,
-                    layer.w2_weight,
-                    topk_weights,
-                    topk_ids,
-                    w1_scale=layer.w13_weight_scale_inv,
-                    w2_scale=layer.w2_weight_scale_inv,
-                    quant_type=QuantType.per_128x128,
-                    activation=(
-                        ActivationType.Silu
-                        if activation == "silu"
-                        else ActivationType.Gelu
-                    ),
-                    expert_mask=layer.expert_mask_gpu,
+            try:
+                if self.block_quant:
+                    return fused_moe(
+                        x,
+                        layer.w13_weight,
+                        layer.w2_weight,
+                        topk_weights,
+                        topk_ids,
+                        w1_scale=layer.w13_weight_scale_inv,
+                        w2_scale=layer.w2_weight_scale_inv,
+                        quant_type=QuantType.per_128x128,
+                        activation=(
+                            ActivationType.Silu
+                            if activation == "silu"
+                            else ActivationType.Gelu
+                        ),
+                        expert_mask=layer.expert_mask_gpu,
+                    )
+                else:
+                    return fused_moe(
+                        x,
+                        layer.w13_weight,
+                        layer.w2_weight,
+                        topk_weights,
+                        topk_ids,
+                        quant_type=QuantType.per_Token,
+                        w1_scale=layer.w13_weight_scale1,
+                        w2_scale=layer.w2_weight_scale1,
+                        activation=(
+                            ActivationType.Silu
+                            if activation == "silu"
+                            else ActivationType.Gelu
+                        ),
+                        expert_mask=layer.expert_mask_gpu,
+                    )
+            except Exception as e:
+                logger.warning_once(
+                    f"aiter fused_moe failed ({type(e).__name__}: {e}), "
+                    "falling back to triton MoE kernel."
                 )
-            else:
-                return fused_moe(
-                    x,
-                    layer.w13_weight,
-                    layer.w2_weight,
-                    topk_weights,
-                    topk_ids,
-                    quant_type=QuantType.per_Token,
-                    w1_scale=layer.w13_weight_scale1,
-                    w2_scale=layer.w2_weight_scale1,
-                    activation=(
-                        ActivationType.Silu
-                        if activation == "silu"
-                        else ActivationType.Gelu
-                    ),
-                    expert_mask=layer.expert_mask_gpu,
-                )
+                return None
         return None
 
 
