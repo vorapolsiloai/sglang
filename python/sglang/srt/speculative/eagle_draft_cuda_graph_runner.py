@@ -314,15 +314,14 @@ class EAGLEDraftCudaGraphRunner:
 
     def _capture_init(self, run_once_fn):
         if _is_hip:
-            # On HIP/ROCm, hipDeviceSynchronize() (torch.cuda.synchronize())
-            # crashes when called inside graph_capture() context because
-            # pynccl_comm.change_state(enable=True) puts the RCCL stream into
-            # graph-capture mode — hipDeviceSynchronize waits on ALL streams
-            # including that RCCL stream, which is illegal.
-            # Use stream-level sync instead: only waits on the capture stream.
+            # On HIP/ROCm, ANY synchronization (device-level or stream-level)
+            # crashes inside graph_capture() context. The pynccl_comm in graph-
+            # capture mode makes RCCL operations non-executing (set up for
+            # capture only). Trying to synchronize a stream with pending RCCL
+            # ops that will never execute causes SIGABRT.
+            # Just run twice to warm up lazy state — no sync needed since
+            # _hip_pre_warmup() already compiled all kernels.
             for _ in range(2):
-                self.stream.synchronize()
-                self.model_runner.tp_group.barrier()
                 run_once_fn()
         else:
             for _ in range(2):
@@ -332,10 +331,8 @@ class EAGLEDraftCudaGraphRunner:
 
     def _capture_graph(self, graph, pool, stream, run_once_fn):
         if _is_hip:
-            # On HIP/ROCm, torch.cuda.graph().__enter__() calls
-            # torch.cuda.synchronize() (hipDeviceSynchronize) which crashes.
-            # Use capture_begin/capture_end directly with stream-level sync.
-            stream.synchronize()
+            # On HIP/ROCm, any synchronization crashes inside graph_capture().
+            # Use capture_begin/capture_end directly without sync.
             graph.capture_begin(pool=pool)
             try:
                 out = run_once_fn()
