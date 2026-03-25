@@ -2072,12 +2072,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if require_gathered_buffer(self.server_args):
             assert require_mlp_tp_gather_ or require_attn_tp_gather(self.server_args)
 
+        # For Eagle3 draft workers with load_lm_head_from_target=True, the model's
+        # logits_processor.vocab_size reflects the target's vocab (e.g. 151936 for
+        # Qwen3-VL) while model_config.vocab_size still holds the base Llama vocab
+        # (e.g. 32000). Use the logits_processor's vocab_size for the buffer so they
+        # stay consistent during the pre-warmup forward pass.
+        effective_vocab_size = self.model_config.vocab_size
+        if (
+            self.is_draft_worker
+            and hasattr(self.model, "logits_processor")
+            and self.model.logits_processor is not None
+        ):
+            effective_vocab_size = self.model.logits_processor.vocab_size
+
         buffers: DecodeInputBuffers = DecodeInputBuffers.create(
             device=self.device,
             max_bs=batch_size,
             max_num_token=num_tokens,
             hidden_size=self.model_config.hidden_size,
-            vocab_size=self.model_config.vocab_size,
+            vocab_size=effective_vocab_size,
             dtype=self.model_config.dtype,
             dp_size=self.server_args.dp_size,
             pp_size=self.server_args.pp_size,
