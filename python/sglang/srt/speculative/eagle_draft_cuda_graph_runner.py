@@ -310,14 +310,13 @@ class EAGLEDraftCudaGraphRunner:
     def _capture_init(self, run_once_fn):
         if _is_hip:
             # On HIP/ROCm, torch.cuda.synchronize() inside a CUDA graph capture
-            # context (even on the default stream) causes a fatal SIGABRT.
-            # All kernel pre-compilation was done in _hip_pre_warmup() before
-            # model_capture_mode() was entered, so skip synchronize() here.
-            # Keep tp_group.barrier() to synchronize TP ranks before each graph
-            # capture — without it, torch.cuda.graph().__enter__() synchronize()
-            # may race with in-flight TP communication.
+            # context causes a fatal SIGABRT. tp_group.barrier() is omitted too:
+            # it uses Gloo (CPU-side) but if one TP rank crashes inside run_once_fn,
+            # surviving ranks deadlock at the barrier indefinitely.
+            # All kernel pre-compilation is done in _hip_pre_warmup() before
+            # model_capture_mode() is entered, so two plain run_once_fn() calls
+            # are sufficient to stabilize any lazy state before graph capture.
             for _ in range(2):
-                self.model_runner.tp_group.barrier()
                 run_once_fn()
         else:
             for _ in range(2):
