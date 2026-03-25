@@ -2160,6 +2160,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
                 if self.is_draft_worker:
                     # Draft worker pre-warmup uses plain DECODE mode; no spec_info needed.
+                    # The Eagle3 draft model's forward() accesses spec_info.hidden_states,
+                    # but llama_eagle3.py guards against None spec_info for pre-warmup.
                     return None
                 else:
                     spec_info = EagleVerifyInput(
