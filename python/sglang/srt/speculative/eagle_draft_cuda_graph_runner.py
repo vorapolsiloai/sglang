@@ -161,6 +161,12 @@ class EAGLEDraftCudaGraphRunner:
         )
         self.buffers.share_buffers()
 
+        if _is_hip:
+            # On HIP/ROCm, triton JIT kernels fail to compile once ANY graph_capture()
+            # context is active (even on the default stream). Pre-compile the multi-step
+            # draft attention triton kernels here, BEFORE model_capture_mode() is entered.
+            self._hip_pre_warmup()
+
         # Capture
         try:
             with model_capture_mode():
@@ -172,6 +178,97 @@ class EAGLEDraftCudaGraphRunner:
 
     def _cache_loc_dtype(self):
         return torch.int64
+
+    def _hip_pre_warmup(self):
+        """Pre-compile multi-step draft attention triton kernels on the default stream.
+
+        On HIP/ROCm, triton JIT kernels cannot be compiled once any graph_capture()
+        context is active (including on the default stream). We must pre-compile
+        all kernels used in draft_forward BEFORE entering model_capture_mode().
+        """
+        import logging
+
+        logger = logging.getLogger(__name__)
+        logger.info(
+            "Running HIP draft multi-step attention pre-warmup to pre-compile triton kernels..."
+        )
+
+        # Use smallest batch size (bs=1) for pre-warmup.
+        bs = 1
+        num_tokens = bs * self.num_tokens_per_bs
+        buffers = self.buffers
+
+        if self.require_mlp_tp_gather:
+            buffers.global_num_tokens_gpu.copy_(
+                torch.tensor([num_tokens] * self.dp_size, dtype=torch.int32)
+            )
+            buffers.global_num_tokens_for_logprob_gpu.copy_(
+                torch.tensor([num_tokens] * self.dp_size, dtype=torch.int32)
+            )
+            global_num_tokens = buffers.global_num_tokens_gpu
+            global_dp_buffer_len = num_tokens * self.dp_size
+            global_num_tokens_for_logprob = buffers.global_num_tokens_for_logprob_gpu
+        elif self.require_attn_tp_gather:
+            buffers.global_num_tokens_gpu.copy_(
+                torch.tensor([num_tokens], dtype=torch.int32)
+            )
+            buffers.global_num_tokens_for_logprob_gpu.copy_(
+                torch.tensor([num_tokens], dtype=torch.int32)
+            )
+            global_num_tokens = buffers.global_num_tokens_gpu
+            global_dp_buffer_len = num_tokens
+            global_num_tokens_for_logprob = buffers.global_num_tokens_for_logprob_gpu
+        else:
+            global_num_tokens = None
+            global_dp_buffer_len = None
+            global_num_tokens_for_logprob = None
+
+        spec_info = EagleDraftInput(
+            topk_p=buffers.topk_p[:bs],
+            topk_index=buffers.topk_index[:bs],
+            hidden_states=buffers.hidden_states[:bs],
+            capture_hidden_mode=CaptureHiddenMode.LAST,
+        )
+
+        forward_batch = ForwardBatch(
+            forward_mode=ForwardMode.DECODE,
+            batch_size=bs,
+            input_ids=None,
+            req_pool_indices=buffers.req_pool_indices[:bs],
+            seq_lens=buffers.seq_lens[:bs],
+            seq_lens_cpu=buffers.seq_lens_cpu[:bs],
+            extend_seq_lens=buffers.extend_seq_lens[:bs],
+            extend_seq_lens_cpu=self.extend_seq_lens_cpu[:bs],
+            req_to_token_pool=self.model_runner.req_to_token_pool,
+            token_to_kv_pool=self.model_runner.token_to_kv_pool,
+            out_cache_loc=buffers.out_cache_loc[: num_tokens * self.speculative_num_steps],
+            seq_lens_sum=buffers.seq_lens[:bs].sum().item(),
+            return_logprob=False,
+            positions=buffers.positions[:num_tokens],
+            mrope_positions=buffers.mrope_positions[:, :num_tokens],
+            global_num_tokens_gpu=global_num_tokens,
+            global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob,
+            dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
+            global_dp_buffer_len=global_dp_buffer_len,
+            spec_algorithm=self.model_runner.spec_algorithm,
+            spec_info=spec_info,
+            capture_hidden_mode=spec_info.capture_hidden_mode,
+        )
+
+        # Use the CUDA-graph state set up by init_cuda_graph_state so that
+        # the triton kernel is compiled for the exact tensor layout used later.
+        self.model_runner.draft_attn_backend.init_forward_metadata_capture_cuda_graph(
+            forward_batch
+        )
+
+        set_dp_buffer_len(global_dp_buffer_len, num_tokens, False)
+        set_is_extend_in_batch(False)
+
+        with torch.inference_mode():
+            self.eagle_worker.draft_forward(forward_batch)
+        torch.cuda.synchronize()
+
+        logger.info("HIP draft multi-step attention pre-warmup completed.")
 
     def can_run(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:
@@ -199,18 +296,6 @@ class EAGLEDraftCudaGraphRunner:
         return torch.cuda.CUDAGraph()
 
     def _capture_init(self, run_once_fn):
-        if _is_hip:
-            # On HIP/ROCm, Triton JIT kernels (e.g. multi-step draft attention)
-            # fail to compile when first called inside the graph_capture() context
-            # (non-default stream). Pre-compile them on the default stream first so
-            # that the subsequent capture-stream warmup only replays cached kernels.
-            torch.cuda.synchronize()
-            self.model_runner.tp_group.barrier()
-            with torch.inference_mode():
-                with torch.cuda.stream(torch.cuda.default_stream()):
-                    run_once_fn()
-            torch.cuda.synchronize()
-
         for _ in range(2):
             torch.cuda.synchronize()
             self.model_runner.tp_group.barrier()
