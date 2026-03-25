@@ -77,6 +77,11 @@ class SiluAndMul(MultiPlatformOp):
         silu_and_mul(x, out)
         return out
 
+    def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
+        # sgl_kernel silu_and_mul crashes on ROCm with sglang_kernel-0.4.0
+        # during CUDA graph capture; use the native PyTorch fallback.
+        return self.forward_native(x)
+
     def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
         if _is_cpu_amx_available:
             out = torch.ops.sgl_kernel.silu_and_mul_cpu(x)
@@ -128,6 +133,11 @@ class GeluAndMul(MultiPlatformOp):
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         return self._forward_impl(x)
 
+    def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
+        # sgl_kernel gelu kernels crash on ROCm with sglang_kernel-0.4.0
+        # during CUDA graph capture; use the native PyTorch fallback.
+        return self.forward_native(x)
+
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
         return self._forward_impl(x)
 
@@ -172,9 +182,9 @@ class QuickGELU(MultiPlatformOp):
         return self.forward_native(x)
 
     def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
-        out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
-        gelu_quick(x, out)
-        return out
+        # sgl_kernel gelu_quick crashes on ROCm with sglang_kernel-0.4.0
+        # during CUDA graph capture; use the native PyTorch fallback.
+        return self.forward_native(x)
 
     def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
         return torch_npu.npu_fast_gelu(x)
