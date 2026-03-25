@@ -264,8 +264,20 @@ class EAGLEDraftCudaGraphRunner:
         set_dp_buffer_len(global_dp_buffer_len, num_tokens, False)
         set_is_extend_in_batch(False)
 
+        # Call draft_forward TWICE:
+        #   1st call: triggers torch.compile async background compilation for
+        #             @torch.compile-decorated helpers (e.g. select_top_k_tokens)
+        #   2nd call: waits for compilation and finalizes the compiled kernel
+        #             (calls torch.cuda.synchronize() safely outside graph capture)
+        # After this, the 3rd call inside _capture_init uses the already-compiled
+        # kernel without needing to synchronize.
         with torch.inference_mode():
-            self.eagle_worker.draft_forward(forward_batch)
+            for _ in range(2):
+                out_cache_loc_backup = forward_batch.out_cache_loc
+                hidden_states_backup = forward_batch.spec_info.hidden_states
+                self.eagle_worker.draft_forward(forward_batch)
+                forward_batch.out_cache_loc = out_cache_loc_backup
+                forward_batch.spec_info.hidden_states = hidden_states_backup
         torch.cuda.synchronize()
 
         logger.info("HIP draft multi-step attention pre-warmup completed.")
