@@ -250,6 +250,13 @@ class EAGLEWorker(TpModelWorker):
         if self.server_args.disable_cuda_graph:
             return
 
+        if _is_hip:
+            logger.warning(
+                "Eagle3 draft CUDA graph capture disabled on ROCm. "
+                "Running draft model in eager mode for debugging."
+            )
+            return
+
         Device2DraftCudaGraphRunner = {
             "npu": EAGLEDraftNpuGraphRunner,
             "cuda": EAGLEDraftCudaGraphRunner,
