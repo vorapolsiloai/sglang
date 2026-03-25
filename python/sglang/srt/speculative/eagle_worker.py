@@ -133,6 +133,13 @@ class EAGLEWorker(TpModelWorker):
         else:
             self.hot_token_id = None
 
+        # On HIP/ROCm, force the draft model's attention backend to triton.
+        # The aiter MHA decode kernel causes GPU abort during CUDA graph capture
+        # warmup on this AMD system, surfacing as a deferred error at F.silu.
+        backup_attention_backend = server_args.attention_backend
+        if _is_hip:
+            server_args.attention_backend = "triton"
+
         # Init draft worker
         if server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
             ctx = draft_tp_context(get_attention_tp_group())
@@ -156,6 +163,9 @@ class EAGLEWorker(TpModelWorker):
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 memory_pool_config=target_worker.model_runner.memory_pool_config,
             )
+
+        # Restore attention backend so subsequent target-worker logic is unaffected.
+        server_args.attention_backend = backup_attention_backend
 
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
 
