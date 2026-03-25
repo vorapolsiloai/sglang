@@ -119,7 +119,12 @@ class EAGLEDraftCudaGraphRunner:
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
             )
             extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
-            topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
+            # Use small positive values instead of zeros to avoid AMD ROCm GPU
+            # kernel issues with torch.topk/torch.gather on all-zero tensors
+            # during CUDA graph capture warm-up runs.
+            topk_p = torch.full(
+                (self.max_bs, self.topk), 1.0 / self.topk, dtype=torch.float32
+            )
             topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
             hidden_states = torch.zeros(
                 (self.max_bs, self.model_runner.model_config.hidden_size),
