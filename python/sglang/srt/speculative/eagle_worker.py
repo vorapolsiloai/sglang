@@ -63,12 +63,14 @@ from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
     is_cuda,
+    is_hip,
     is_npu,
     next_power_of_2,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
 _is_npu = is_npu()
+_is_hip = is_hip()
 
 if is_cuda():
     from sgl_kernel import segment_packbits  # noqa: F401
@@ -236,6 +238,14 @@ class EAGLEWorker(TpModelWorker):
         self.cuda_graph_runner_for_draft_extend = None
 
         if self.server_args.disable_cuda_graph:
+            return
+
+        if _is_hip:
+            logger.warning(
+                "Eagle3 draft CUDA graph capture disabled on ROCm due to "
+                "kernel compatibility issues with sglang_kernel-0.4.0. "
+                "Running draft model in eager mode."
+            )
             return
 
         Device2DraftCudaGraphRunner = {
