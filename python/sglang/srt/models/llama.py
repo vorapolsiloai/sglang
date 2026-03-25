@@ -252,8 +252,16 @@ class LlamaDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        rope_theta = config.rope_parameters["rope_theta"]
-        rope_scaling = config.rope_parameters
+        # transformers v5 uses rope_parameters, v4 uses direct attributes
+        rope_parameters = getattr(config, "rope_parameters", None) or getattr(
+            config, "rope_scaling", None
+        )
+        rope_theta = (
+            rope_parameters["rope_theta"]
+            if rope_parameters and "rope_theta" in rope_parameters
+            else getattr(config, "rope_theta", 10000.0)
+        )
+        rope_scaling = rope_parameters
         if rope_scaling is not None and getattr(
             config, "original_max_position_embeddings", None
         ):
