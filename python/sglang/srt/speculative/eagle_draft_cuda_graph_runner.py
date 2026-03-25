@@ -308,10 +308,18 @@ class EAGLEDraftCudaGraphRunner:
         return torch.cuda.CUDAGraph()
 
     def _capture_init(self, run_once_fn):
-        for _ in range(2):
-            torch.cuda.synchronize()
-            self.model_runner.tp_group.barrier()
-            run_once_fn()
+        if _is_hip:
+            # On HIP/ROCm, torch.cuda.synchronize() inside a CUDA graph capture
+            # context (even on the default stream) causes a fatal SIGABRT.
+            # All kernel pre-compilation was done in _hip_pre_warmup() before
+            # model_capture_mode() was entered, so skip synchronize() here.
+            for _ in range(2):
+                run_once_fn()
+        else:
+            for _ in range(2):
+                torch.cuda.synchronize()
+                self.model_runner.tp_group.barrier()
+                run_once_fn()
 
     def _capture_graph(self, graph, pool, stream, run_once_fn):
         with torch.cuda.graph(graph, pool=pool, stream=stream):
