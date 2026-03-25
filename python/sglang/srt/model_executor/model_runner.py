@@ -1964,13 +1964,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device != "cuda":
             return
 
-        if is_hip() and not self.is_draft_worker:
-            # On AMD ROCm, Triton JIT kernels (e.g. w8a8_block_fp8_matmul_triton)
-            # fail to compile when first called inside the graph_capture() context
-            # (which switches the CUDA stream). Pre-compile them here on the default
-            # stream so CUDA graph capture only replays already-cached kernels.
-            # Skip for draft workers: their CUDA graph capture is already disabled
-            # on HIP (eagle_worker.py:init_cuda_graphs), so no warmup is needed.
+        if is_hip():
+            # On AMD ROCm, Triton JIT kernels (e.g. w8a8_block_fp8_matmul_triton,
+            # attention) fail to compile when first called inside the graph_capture()
+            # context (which switches the CUDA stream). Pre-compile them here on the
+            # default stream so CUDA graph capture only replays already-cached kernels.
+            # This applies to both target workers and Eagle3 draft workers.
             logger.info("Running HIP kernel pre-warmup to pre-compile Triton JIT kernels...")
             with torch.inference_mode():
                 self._dummy_run(batch_size=1)
@@ -2041,7 +2040,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             or self.spec_algorithm.is_ngram()
         ):
             if self.is_draft_worker:
-                raise RuntimeError("This should not happen")
+                # Draft worker pre-warmup: use plain DECODE mode with no spec_info
+                # so Triton JIT kernels (e.g. attention) get compiled on the default
+                # stream before CUDA graph capture switches the stream.
+                capture_forward_mode = ForwardMode.DECODE
+                num_tokens_per_bs = 1
             else:
                 capture_forward_mode = ForwardMode.TARGET_VERIFY
                 num_tokens_per_bs = self.server_args.speculative_num_draft_tokens
@@ -2156,7 +2159,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
                 if self.is_draft_worker:
-                    raise RuntimeError("This should not happen.")
+                    # Draft worker pre-warmup uses plain DECODE mode; no spec_info needed.
+                    return None
                 else:
                     spec_info = EagleVerifyInput(
                         draft_token=None,
