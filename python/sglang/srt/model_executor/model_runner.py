@@ -1964,6 +1964,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device != "cuda":
             return
 
+        if is_hip():
+            # On AMD ROCm, Triton JIT kernels (e.g. w8a8_block_fp8_matmul_triton)
+            # fail to compile when first called inside the graph_capture() context
+            # (which switches the CUDA stream). Pre-compile them here on the default
+            # stream so CUDA graph capture only replays already-cached kernels.
+            logger.info("Running HIP kernel pre-warmup to pre-compile Triton JIT kernels...")
+            with torch.inference_mode():
+                self._dummy_run(batch_size=1)
+            torch.cuda.synchronize()
+            logger.info("HIP kernel pre-warmup completed.")
+
         if self._should_run_flashinfer_autotune():
             self._flashinfer_autotune()
 
