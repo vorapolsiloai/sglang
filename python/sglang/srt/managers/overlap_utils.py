@@ -26,13 +26,15 @@ def _resolve_future_token_ids_native(input_ids, future_token_ids_map):
     )
 
 
-if _is_cuda or _is_hip:
+if _is_cuda:
     from sglang.jit_kernel.resolve_future_token_ids import (
         resolve_future_token_ids_cuda,
     )
 
     _resolve_future_token_ids = resolve_future_token_ids_cuda
 else:
+    # On HIP/ROCm, the JIT kernel uses TVM FFI which requires CUDA_HOME.
+    # Use the native PyTorch fallback instead.
     _resolve_future_token_ids = _resolve_future_token_ids_native
 
 
