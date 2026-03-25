@@ -26,11 +26,14 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.utils import (
+    is_hip,
     require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_sync,
     require_mlp_tp_gather,
 )
+
+_is_hip = is_hip()
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker import EAGLEWorker
@@ -196,6 +199,18 @@ class EAGLEDraftCudaGraphRunner:
         return torch.cuda.CUDAGraph()
 
     def _capture_init(self, run_once_fn):
+        if _is_hip:
+            # On HIP/ROCm, Triton JIT kernels (e.g. multi-step draft attention)
+            # fail to compile when first called inside the graph_capture() context
+            # (non-default stream). Pre-compile them on the default stream first so
+            # that the subsequent capture-stream warmup only replays cached kernels.
+            torch.cuda.synchronize()
+            self.model_runner.tp_group.barrier()
+            with torch.inference_mode():
+                with torch.cuda.stream(torch.cuda.default_stream()):
+                    run_once_fn()
+            torch.cuda.synchronize()
+
         for _ in range(2):
             torch.cuda.synchronize()
             self.model_runner.tp_group.barrier()
