@@ -33,7 +33,9 @@ if TYPE_CHECKING:
 if _is_cuda:
     from sgl_kernel import fast_topk
 elif _is_hip:
-    from sgl_kernel import fast_topk
+    # sgl_kernel fast_topk crashes on ROCm during CUDA graph capture with
+    # older sgl-kernel builds; fall back to the pure-PyTorch implementation.
+    from sglang.srt.utils.common import fast_topk
 else:
     from sglang.srt.utils.common import fast_topk
 
