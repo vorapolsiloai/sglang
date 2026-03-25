@@ -1435,6 +1435,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 weight_loader(param, loaded_weight)
 
 
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
         if not self.pp_group.is_last_rank:
             return
