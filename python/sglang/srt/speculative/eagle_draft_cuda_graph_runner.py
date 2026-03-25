@@ -308,20 +308,39 @@ class EAGLEDraftCudaGraphRunner:
         return torch.cuda.CUDAGraph()
 
     def _capture_init(self, run_once_fn):
-        # On HIP/ROCm, synchronize() previously crashed here due to torch.compile
-        # async finalization calling synchronize() in the background. Now that all
-        # torch.compile-decorated functions in the draft forward path are disabled
-        # on HIP, the standard synchronize()+barrier()+run_once() pattern works —
-        # matching the target model's capture behavior.
-        for _ in range(2):
-            torch.cuda.synchronize()
-            self.model_runner.tp_group.barrier()
-            run_once_fn()
+        if _is_hip:
+            # On HIP/ROCm, hipDeviceSynchronize() (torch.cuda.synchronize())
+            # crashes when called inside graph_capture() context because
+            # pynccl_comm.change_state(enable=True) puts the RCCL stream into
+            # graph-capture mode — hipDeviceSynchronize waits on ALL streams
+            # including that RCCL stream, which is illegal.
+            # Use stream-level sync instead: only waits on the capture stream.
+            for _ in range(2):
+                self.stream.synchronize()
+                self.model_runner.tp_group.barrier()
+                run_once_fn()
+        else:
+            for _ in range(2):
+                torch.cuda.synchronize()
+                self.model_runner.tp_group.barrier()
+                run_once_fn()
 
     def _capture_graph(self, graph, pool, stream, run_once_fn):
-        with torch.cuda.graph(graph, pool=pool, stream=stream):
-            out = run_once_fn()
-        return out
+        if _is_hip:
+            # On HIP/ROCm, torch.cuda.graph().__enter__() calls
+            # torch.cuda.synchronize() (hipDeviceSynchronize) which crashes.
+            # Use capture_begin/capture_end directly with stream-level sync.
+            stream.synchronize()
+            graph.capture_begin(pool=pool)
+            try:
+                out = run_once_fn()
+            finally:
+                graph.capture_end()
+            return out
+        else:
+            with torch.cuda.graph(graph, pool=pool, stream=stream):
+                out = run_once_fn()
+            return out
 
     def _replay(self, forward_batch: ForwardBatch):
         self.graphs[self.bs].replay()
