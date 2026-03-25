@@ -2360,6 +2360,20 @@ class ServerArgs:
             if model_config.context_len > 8192:
                 self.mem_fraction_static *= 0.85
 
+            # AiterMultiStepDraftBackend crashes during CUDA graph capture on ROCm
+            # for non-MLA Eagle3 draft models. Force triton for the draft attention
+            # backend when speculative decoding is active and no override is set.
+            if (
+                self.speculative_algorithm is not None
+                and not self.use_mla_backend
+                and self.speculative_draft_attention_backend is None
+            ):
+                logger.warning(
+                    "Aiter backend with non-MLA speculative decoding detected on ROCm. "
+                    "Forcing speculative_draft_attention_backend=triton to avoid CUDA graph crash."
+                )
+                self.speculative_draft_attention_backend = "triton"
+
         # Other platforms backends
         if (
             self.attention_backend == "intel_amx"
