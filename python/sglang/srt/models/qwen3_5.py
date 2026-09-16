@@ -395,6 +395,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self._bind_packed_weight_loaders(self.in_proj_ba)
         self._fused_in_proj_weight: Optional[torch.Tensor] = None
         self._fused_in_proj_qkvz_width = 0
+        # Resolved on first forward because the linear-attention backend is
+        # configured after model construction.
+        self._decode_takes_projection_views: Optional[bool] = None
         self._fused_input_proj_cpu_enabled = LazyValue(
             lambda: (
                 _is_cpu
@@ -841,6 +844,19 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         use_fused_contiguous_unpack = (
             self.num_v_heads // self.num_k_heads in _GDN_FUSED_QKVZBA_RATIOS
         )
+        if self._decode_takes_projection_views is None:
+            mamba_config = get_exec().mamba
+            decode_backend = (
+                mamba_config.linear_attn_decode_backend
+                or mamba_config.linear_attn_backend
+            )
+            self._decode_takes_projection_views = (
+                _is_cuda or _is_hip
+            ) and decode_backend == "triton"
+        use_decode_projection_views = (
+            self._decode_takes_projection_views
+            and forward_batch.forward_mode.is_decode()
+        )
         if use_fused_decode_proj_conv:
             # GDN owns indexed Conv1D state and the safe unpack/Conv boundary;
             # it replaces these temporary B/A placeholders before recurrence.
@@ -848,6 +864,18 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             z = None
             b = projected_states_ba
             a = projected_states_ba
+        elif use_decode_projection_views:
+            # Qwen3.5 stores q/k/v/z contiguously, so mixed_qkv and z are
+            # already the leading and trailing regions of the projection.
+            # Triton decode consumers honor their non-contiguous row strides.
+            k_tp = self.key_dim // self.attn_tp_size
+            v_tp = self.value_dim // self.attn_tp_size
+            nv_tp = self.num_v_heads // self.attn_tp_size
+            mixed_qkv, z_flat = projected_states_qkvz.split(
+                [2 * k_tp + v_tp, v_tp], dim=-1
+            )
+            z = z_flat.reshape(z_flat.shape[0], -1, self.head_v_dim)
+            b, a = projected_states_ba.split([nv_tp, nv_tp], dim=-1)
         elif use_fused_contiguous_unpack and not _is_npu:
             if _is_cpu:
                 num_k_heads_tp = self.num_k_heads // self.attn_tp_size
