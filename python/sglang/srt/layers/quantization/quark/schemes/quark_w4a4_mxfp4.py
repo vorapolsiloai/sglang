@@ -39,13 +39,33 @@ _ASM_FP4_SCALE_COL_MULTIPLE = 8
 # N <= 128 at 2 <= M <= 64 (measured on ROCm/aiter@e7d2453f2, MI355X).
 # TODO(vorapolsiloai): link the AITER issue; drop once the heuristic is fixed.
 _ASM_FP4_UNSAFE_MAX_N = 128
+_MXFP4_ROUND_UP = 1
+_MXFP4_ROUND_EVEN = 2
+_aiter_asm_mxfp4_round_mode = _MXFP4_ROUND_UP
 _aiter_fp4x2_dtype = torch.uint8
 _aiter_e8m0_dtype = torch.uint8
+_fused_rmsnorm_gated_ops = None
 
 # Keep this path opt-in while the AITER ASM integration is validated across the
 # Quark model matrix. Unlike the Triton fallback, it consumes AITER's
 # a4w4_blockscale_tuned_gemm CSVs.
 _use_aiter_asm_fp4_gemm = _is_hip and envs.SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM.get()
+
+
+def _get_fused_rmsnorm_gated_ops():
+    """Load and cache the Qwen GDN producer without changing other import paths."""
+    global _fused_rmsnorm_gated_ops
+    if _fused_rmsnorm_gated_ops is None:
+        from sglang.kernels.ops.attention.fla.rmsnorm_gated_mxfp4 import (
+            can_use_rmsnorm_gated_mxfp4,
+            rmsnorm_gated_mxfp4_quant,
+        )
+
+        _fused_rmsnorm_gated_ops = (
+            can_use_rmsnorm_gated_mxfp4,
+            rmsnorm_gated_mxfp4_quant,
+        )
+    return _fused_rmsnorm_gated_ops
 
 
 def _asm_fp4_scale_swizzle_supported(weight_scale: torch.Tensor) -> bool:
@@ -177,7 +197,9 @@ if _is_hip:
     )
     from aiter.ops.triton.quant import dynamic_mxfp4_quant as _dynamic_mxfp4_quant_orig
     from aiter.utility import dtypes as aiter_dtypes
+    from aiter.utility.mx_types import MX_DEFAULT_ROUND_MODE
 
+    _aiter_asm_mxfp4_round_mode = int(MX_DEFAULT_ROUND_MODE)
     _aiter_fp4x2_dtype = aiter_dtypes.fp4x2
     _aiter_e8m0_dtype = aiter_dtypes.fp8_e8m0
 
@@ -270,9 +292,16 @@ if _is_hip:
         x: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         rows, cols = x.shape
-        x_fp4 = torch.empty((rows, cols // 2), dtype=torch.uint8, device=x.device)
+        x_fp4 = torch.empty(
+            (rows, cols // 2), dtype=aiter_dtypes.fp4x2, device=x.device
+        )
         scales = torch.empty(
-            (rows, (cols + 31) // 32), dtype=torch.uint8, device=x.device
+            (
+                (rows + 255) // 256 * 256,
+                ((cols + 31) // 32 + 7) // 8 * 8,
+            ),
+            dtype=aiter_dtypes.fp8_e8m0,
+            device=x.device,
         )
         return x_fp4, scales
 
@@ -457,6 +486,53 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
     @classmethod
     def get_min_capability(cls) -> int:
         return 70
+
+    def prepare_fused_rmsnorm_gated_input(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        z: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        *,
+        num_heads: int,
+        activation: str,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Prepare a prequantized input when this layer can consume it exactly."""
+        if not _is_hip or getattr(layer, "dequantized_bf16", False):
+            return None
+
+        can_use_rmsnorm_gated_mxfp4, rmsnorm_gated_mxfp4_quant = (
+            _get_fused_rmsnorm_gated_ops()
+        )
+        use_asm = getattr(layer, "use_aiter_asm_fp4_gemm", False)
+        if not can_use_rmsnorm_gated_mxfp4(
+            x,
+            z,
+            weight,
+            num_heads=num_heads,
+            activation=activation,
+            shuffle_scales=use_asm,
+        ):
+            return None
+        if num_heads * x.shape[1] != getattr(layer, "input_size_per_partition", None):
+            return None
+
+        round_mode = _aiter_asm_mxfp4_round_mode if use_asm else _MXFP4_ROUND_EVEN
+        if round_mode not in (_MXFP4_ROUND_UP, _MXFP4_ROUND_EVEN):
+            return None
+        prequantized = rmsnorm_gated_mxfp4_quant(
+            x,
+            z,
+            weight,
+            eps,
+            num_heads=num_heads,
+            activation=activation,
+            round_mode=round_mode,
+            shuffle_scales=use_asm,
+            use_native_dtypes=use_asm,
+        )
+        return _AsmShuffledMxfp4Input(prequantized) if use_asm else prequantized
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if not self.is_checkpoint_mxfp4_serialized:
