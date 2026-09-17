@@ -6,7 +6,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -39,6 +39,126 @@ class TestQuarkMxfp4AsmPrequantizedInput(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "native FP4x2"):
             _validate_asm_prequantized_input(
                 self.layer, (self.x_q.view(torch.int8), self.x_scales)
+            )
+
+    def test_scheme_prepares_consumer_specific_layout(self):
+        scheme = QuarkW4A4MXFP4({}, {}, is_checkpoint_mxfp4_serialized=True)
+        layer = SimpleNamespace(
+            dequantized_bf16=False,
+            input_size_per_partition=256,
+            use_aiter_asm_fp4_gemm=False,
+        )
+        x = torch.empty((4, 64), dtype=torch.bfloat16)
+        z = torch.empty_like(x)
+        weight = torch.empty(64, dtype=torch.bfloat16)
+        expected = (
+            torch.empty((1, 128), dtype=torch.uint8),
+            torch.empty((1, 8), dtype=torch.uint8),
+        )
+        quant = Mock(return_value=expected)
+        can_use = Mock(return_value=True)
+
+        with (
+            patch.object(quark_w4a4_mxfp4, "_is_hip", True),
+            patch.object(
+                quark_w4a4_mxfp4,
+                "_get_fused_rmsnorm_gated_ops",
+                return_value=(can_use, quant),
+            ),
+        ):
+            actual = scheme.prepare_fused_rmsnorm_gated_input(
+                layer,
+                x,
+                z,
+                weight,
+                1e-6,
+                num_heads=4,
+                activation="silu",
+            )
+            self.assertIs(actual, expected)
+            self.assertEqual(quant.call_args.kwargs["round_mode"], 2)
+            self.assertFalse(quant.call_args.kwargs["shuffle_scales"])
+            self.assertFalse(quant.call_args.kwargs["use_native_dtypes"])
+            self.assertFalse(can_use.call_args.kwargs["shuffle_scales"])
+
+            layer.use_aiter_asm_fp4_gemm = True
+            quant.reset_mock()
+            can_use.reset_mock()
+            actual = scheme.prepare_fused_rmsnorm_gated_input(
+                layer,
+                x,
+                z,
+                weight,
+                1e-6,
+                num_heads=4,
+                activation="silu",
+            )
+            self.assertIsInstance(actual, _AsmShuffledMxfp4Input)
+            self.assertIs(actual[0], expected[0])
+            self.assertIs(actual[1], expected[1])
+            self.assertEqual(quant.call_args.kwargs["round_mode"], 1)
+            self.assertTrue(quant.call_args.kwargs["shuffle_scales"])
+            self.assertTrue(quant.call_args.kwargs["use_native_dtypes"])
+            self.assertTrue(can_use.call_args.kwargs["shuffle_scales"])
+
+    def test_scheme_falls_back_for_incompatible_consumer(self):
+        scheme = QuarkW4A4MXFP4({}, {}, is_checkpoint_mxfp4_serialized=True)
+        layer = SimpleNamespace(
+            dequantized_bf16=False,
+            input_size_per_partition=256,
+            use_aiter_asm_fp4_gemm=True,
+        )
+        x = torch.empty((4, 64), dtype=torch.bfloat16)
+        z = torch.empty_like(x)
+        weight = torch.empty(64, dtype=torch.bfloat16)
+        quant = Mock()
+
+        with (
+            patch.object(quark_w4a4_mxfp4, "_is_hip", True),
+            patch.object(
+                quark_w4a4_mxfp4,
+                "_get_fused_rmsnorm_gated_ops",
+                return_value=(Mock(return_value=True), quant),
+            ),
+            patch.object(quark_w4a4_mxfp4, "_aiter_asm_mxfp4_round_mode", 0),
+        ):
+            self.assertIsNone(
+                scheme.prepare_fused_rmsnorm_gated_input(
+                    layer,
+                    x,
+                    z,
+                    weight,
+                    1e-6,
+                    num_heads=4,
+                    activation="silu",
+                )
+            )
+            quant.assert_not_called()
+
+            layer.input_size_per_partition = 512
+            self.assertIsNone(
+                scheme.prepare_fused_rmsnorm_gated_input(
+                    layer,
+                    x,
+                    z,
+                    weight,
+                    1e-6,
+                    num_heads=4,
+                    activation="silu",
+                )
+            )
+
+            layer.dequantized_bf16 = True
+            self.assertIsNone(
+                scheme.prepare_fused_rmsnorm_gated_input(
+                    layer,
+                    x,
+                    z,
+                    weight,
+                    1e-6,
+                    num_heads=4,
+                    activation="silu",
+                )
             )
 
     def test_asm_gemm_consumes_tuple_without_requantizing(self):
