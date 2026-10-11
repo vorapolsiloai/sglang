@@ -16,7 +16,7 @@
 
 import logging
 import os
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import Iterable, Optional, Set, Tuple, Union
 
 import torch
@@ -89,6 +89,10 @@ from sglang.srt.layers.parameter import (
     PerTensorScaleParameter,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
+    AsmMxfp4Input,
+    QuarkW4A4MXFP4,
+)
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
     bf16_gemm_dispatch,
@@ -230,6 +234,138 @@ def _maybe_enable_silu_fp4_quant_fusion(mlp: nn.Module) -> None:
     logger.info("Enabled fused SiLU+mul+FP4-quant for dense MLP down_proj input.")
 
 
+def _maybe_enable_silu_mxfp4_quant_fusion(mlp: nn.Module) -> None:
+    """Fuse SiLU+mul with the down_proj MXFP4 input quantization on ROCm.
+
+    AITER's act_mul_and_mxfp4_quant(shuffle=True) replaces act_and_mul plus
+    per_1x32_f4_quant and hands down_proj an AsmMxfp4Input. Enabled when both
+    dense-MLP projections are Quark W4A4 MXFP4; Qwen2MoeMLP takes the fused
+    path only when down_proj runs the AITER ASM FP4 GEMM, which is opt-in
+    (SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM). Kill switch:
+    SGLANG_DISABLE_SILU_MXFP4_QUANT_FUSION=1.
+
+    Numerics: the producer asks for scaling_mode="ceil" (RoundUp, as in
+    per_1x32_f4_quant). AITER releases that ignore scaling_mode use Quark
+    "even" rounding instead: a valid MXFP4 input, not bit-identical to the
+    unfused one.
+    TODO(vorapolsiloai): link the AITER PR that honours scaling_mode="ceil".
+    """
+    if not _is_hip or envs.SGLANG_DISABLE_SILU_MXFP4_QUANT_FUSION.get():
+        return
+    if not all(
+        isinstance(getattr(proj, "scheme", None), QuarkW4A4MXFP4)
+        for proj in (mlp.gate_up_proj, mlp.down_proj)
+    ):
+        return
+    try:
+        from aiter.ops.triton.activation import act_mul_and_mxfp4_quant  # noqa: F401
+    except ImportError:
+        return
+    mlp._enable_silu_mxfp4_quant_fusion = True
+    _log_once("Enabled fused SiLU+mul+MXFP4-quant for dense MLP down_proj input.")
+
+
+@lru_cache(maxsize=None)
+def _log_once(message: str) -> None:
+    logger.info(message)
+
+
+def _mxfp4_asm_input(linear: Optional[nn.Module], num_tokens: int) -> bool:
+    """Whether ``linear`` takes a prequantized AsmMxfp4Input for this batch."""
+    return (
+        num_tokens > 0
+        and getattr(linear, "use_aiter_asm_fp4_gemm", False)
+        and not torch.compiler.is_compiling()
+        and not get_forward().sp_active
+        # Under DP attention the norm output is gathered before the projection.
+        and not is_dp_attention_enabled()
+    )
+
+
+class _GemmaRMSNormMXFP4Quant(GemmaRMSNorm):
+    """Gemma add+RMSNorm that also MXFP4-quantizes its output.
+
+    One AITER kernel adds the residual, normalizes and writes fp4x2 with
+    swizzled E8M0 scales (an AsmMxfp4Input), replacing the add+norm kernel and
+    the consumer's per_1x32_f4_quant. ``consumes_mxfp4(num_tokens)`` decides
+    per batch, since the ASM GEMM is chosen after weight loading; without a
+    residual (first layer) or with a post-residual addition the bf16 norm runs.
+    """
+
+    def __init__(self, hidden_size: int, eps: float, consumes_mxfp4) -> None:
+        super().__init__(hidden_size, eps=eps)
+        from aiter.ops.rmsnorm import add_rmsnorm_quant
+
+        self._add_rmsnorm_quant = add_rmsnorm_quant
+        self._consumes_mxfp4 = consumes_mxfp4
+
+    def forward_hip(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ):
+        if (
+            residual is not None
+            and post_residual_addition is None
+            and x.dim() == 2
+            and x.dtype == residual.dtype == self.weight.dtype == torch.bfloat16
+            and x.is_contiguous()
+            and residual.is_contiguous()
+            and self._consumes_mxfp4(x.shape[0])
+        ):
+            m, k = x.shape
+            x_q = torch.empty(m, k // 2, dtype=torch.float4_e2m1fn_x2, device=x.device)
+            # Scale rows padded to the 256-row tiles the ASM GEMM reads.
+            x_scales = torch.empty(
+                (m + 255) // 256 * 256,
+                k // 32,
+                dtype=torch.float8_e8m0fnu,
+                device=x.device,
+            )
+            residual_out = torch.empty_like(x)
+            # group_size=32, shuffle_scale=True, gemma_norm=True (1 + weight).
+            self._add_rmsnorm_quant(
+                x_q,
+                x,
+                residual,
+                residual_out,
+                x_scales,
+                self.weight.data,
+                self.variance_epsilon,
+                32,
+                True,
+                True,
+            )
+            return AsmMxfp4Input(x_q, x_scales), residual_out
+        return super().forward_hip(x, residual, post_residual_addition)
+
+
+def _gemma_rms_norm_for(
+    config: Qwen3_5TextConfig, consumer: Optional[nn.Module], consumes_mxfp4
+) -> GemmaRMSNorm:
+    """The Gemma RMSNorm in front of ``consumer``: _GemmaRMSNormMXFP4Quant on
+    ROCm/AITER gfx95 when the consumer is Quark W4A4 MXFP4, else GemmaRMSNorm.
+    Kill switch: SGLANG_ROCM_DISABLE_NORM_MXFP4_QUANT_FUSION=1."""
+    hidden_size, eps = config.hidden_size, config.rms_norm_eps
+    if (
+        not (_use_aiter and _is_gfx95)
+        or envs.SGLANG_ROCM_DISABLE_NORM_MXFP4_QUANT_FUSION.get()
+        # The AITER kernel covers hidden sizes up to 8192; the ASM GEMM reads
+        # K in multiples of 256.
+        or hidden_size > 8192
+        or hidden_size % 256 != 0
+        or not isinstance(getattr(consumer, "scheme", None), QuarkW4A4MXFP4)
+    ):
+        return GemmaRMSNorm(hidden_size, eps=eps)
+    try:
+        norm = _GemmaRMSNormMXFP4Quant(hidden_size, eps, consumes_mxfp4)
+    except ImportError:
+        return GemmaRMSNorm(hidden_size, eps=eps)
+    _log_once("Enabled fused Gemma add+RMSNorm+MXFP4-quant for MXFP4 projections.")
+    return norm
+
+
 def _use_mnnvl_cutedsl_fusion(config: Qwen3_5TextConfig, is_nextn: bool) -> bool:
     return bool(
         not is_nextn
@@ -306,6 +442,10 @@ def _fp8_tuple_input(linear: nn.Module, num_tokens: int) -> bool:
 def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
     if not isinstance(hidden_states, tuple):
         return hidden_states
+    if isinstance(hidden_states, AsmMxfp4Input):
+        if getattr(linear, "use_aiter_asm_fp4_gemm", False):
+            return hidden_states
+        raise TypeError(f"{linear.__class__.__name__} cannot consume AsmMxfp4Input")
     if len(hidden_states) == 3:
         hs_bf16, hs_fp8, hs_scale = hidden_states
         if _linear_accepts_fp8_tuple(linear):
@@ -1129,14 +1269,17 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 reduce_results=False,
             )
             _maybe_enable_silu_fp4_quant_fusion(self.mlp)
+            _maybe_enable_silu_mxfp4_quant_fusion(self.mlp)
             is_layer_sparse = False
             is_next_layer_sparse = False
         else:
             raise ValueError(f"Invalid model type: {config.model_type}")
 
+        # in_proj_ba also reads the input norm, so it stays bf16 here.
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = GemmaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+        gate_up_proj = getattr(self.mlp, "gate_up_proj", None)
+        self.post_attention_layernorm = _gemma_rms_norm_for(
+            config, gate_up_proj, partial(_mxfp4_asm_input, gate_up_proj)
         )
         # GDN layers need both bf16 (for the small in_proj_ba gating
         # projection) and a quantized tuple only when in_proj_qkvz can consume
@@ -1320,6 +1463,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 # The stage boundary completes this stage's sum.
                 reduce_results=False,
             )
+            _maybe_enable_silu_mxfp4_quant_fusion(self.mlp)
             is_layer_sparse = False
             is_next_layer_sparse = False
         elif config.model_type in _QWEN3_5_MOE_TEXT_MODEL_TYPES:
@@ -1343,9 +1487,12 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         else:
             raise ValueError(f"Invalid model type: {config.model_type}")
 
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = GemmaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+        self.input_layernorm = _gemma_rms_norm_for(
+            config, self.qkv_proj, partial(_mxfp4_asm_input, self.qkv_proj)
+        )
+        gate_up_proj = getattr(self.mlp, "gate_up_proj", None)
+        self.post_attention_layernorm = _gemma_rms_norm_for(
+            config, gate_up_proj, partial(_mxfp4_asm_input, gate_up_proj)
         )
 
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)

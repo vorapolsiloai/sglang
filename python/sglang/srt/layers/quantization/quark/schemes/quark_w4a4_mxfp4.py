@@ -2,7 +2,7 @@
 
 import logging
 import threading
-from typing import Any, Callable, Optional
+from typing import Any, Callable, NamedTuple, Optional
 
 import torch
 
@@ -87,10 +87,68 @@ def _shuffle_asm_fp4_act_scale(x_scales: torch.Tensor) -> torch.Tensor:
     return _swizzle_asm_fp4_scale(padded).view(torch.float8_e8m0fnu)
 
 
+class AsmMxfp4Input(NamedTuple):
+    """An activation already in gemm_a4w4's input layout.
+
+    ``x_fp4`` is (M, K/2) fp4x2 (or uint8); ``x_scales`` is (round_up(M, 256),
+    K/32) E8M0 (or uint8) in the swizzled ASM tile order, i.e. what
+    ``per_1x32_f4_quant(shuffle=True)`` returns. Producers that emit this layout
+    return the marker so the consumer skips the re-pad and re-swizzle that a
+    plain ``(x_fp4, x_scales)`` tuple (row-major scales) gets.
+    """
+
+    x_fp4: torch.Tensor
+    x_scales: torch.Tensor
+
+
+_ASM_FP4_ACT_DTYPES = (torch.uint8, torch.float4_e2m1fn_x2)
+_ASM_FP4_SCALE_DTYPES = (torch.uint8, torch.float8_e8m0fnu)
+
+
+def _validate_asm_mxfp4_input(
+    x: AsmMxfp4Input, in_features: Optional[int]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Check an AsmMxfp4Input against the gemm_a4w4 contract; return its views."""
+    x_q, x_scales = x
+    if x_q.ndim != 2 or x_scales.ndim != 2:
+        raise ValueError(
+            "AsmMxfp4Input expects 2D tensors; got "
+            f"x_fp4 {tuple(x_q.shape)}, x_scales {tuple(x_scales.shape)}"
+        )
+    if x_q.dtype not in _ASM_FP4_ACT_DTYPES or x_scales.dtype not in (
+        _ASM_FP4_SCALE_DTYPES
+    ):
+        raise ValueError(
+            f"AsmMxfp4Input dtypes must be fp4x2/uint8 and e8m0/uint8; got "
+            f"{x_q.dtype}, {x_scales.dtype}"
+        )
+    if x_q.device != x_scales.device:
+        raise ValueError("AsmMxfp4Input tensors must be on the same device")
+    if not (x_q.is_contiguous() and x_scales.is_contiguous()):
+        raise ValueError("AsmMxfp4Input tensors must be contiguous")
+    m, k = x_q.shape[0], x_q.shape[1] * 2
+    if in_features is not None and k != in_features:
+        raise ValueError(f"AsmMxfp4Input has K={k}, the layer expects {in_features}")
+    if k % (32 * _ASM_FP4_SCALE_COL_MULTIPLE) != 0:
+        raise ValueError(f"AsmMxfp4Input needs K % 256 == 0; got K={k}")
+    row_tile = _ASM_FP4_ACT_SCALE_ROW_MULTIPLE
+    expected = ((m + row_tile - 1) // row_tile * row_tile, k // 32)
+    if tuple(x_scales.shape) != expected:
+        raise ValueError(
+            f"AsmMxfp4Input scales must be padded to {expected} for M={m}, K={k}; "
+            f"got {tuple(x_scales.shape)}"
+        )
+    return x_q.view(torch.float4_e2m1fn_x2), x_scales.view(torch.float8_e8m0fnu)
+
+
 def _asm_fp4_prequantized_input(
     x: tuple[torch.Tensor, ...],
+    in_features: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Adapt an already-quantized ``(x_fp4, x_scales)`` activation for gemm_a4w4."""
+    if isinstance(x, AsmMxfp4Input):
+        # Scales are already padded and swizzled; swizzling again scrambles them.
+        return _validate_asm_mxfp4_input(x, in_features)
     # The 3- and 5-tuples request Triton-only fused epilogues (atomic pre-quant,
     # split + cat); weights are already preshuffled, so there is no fallback.
     if len(x) != 2:
@@ -866,15 +924,24 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
         # (The fused tuple-input paths below are only used by MLA attention
         # projections, which are excluded from quantization for this checkpoint,
         # so a plain-tensor activation is what reaches here.)
+        use_asm = getattr(layer, "use_aiter_asm_fp4_gemm", False)
+        if isinstance(x, AsmMxfp4Input) and not use_asm:
+            # The other paths read row-major scales and would misread these.
+            raise TypeError(
+                "AsmMxfp4Input (ASM-swizzled scales) reached a layer without the "
+                "AITER ASM FP4 GEMM; the producer must check use_aiter_asm_fp4_gemm."
+            )
         if getattr(layer, "dequantized_bf16", False):
             if isinstance(x, tuple):
                 x = x[0]
             return torch.nn.functional.linear(x, layer.weight, bias)
 
-        if getattr(layer, "use_aiter_asm_fp4_gemm", False):
+        if use_asm:
             output_shape = None
             if isinstance(x, tuple):
-                x_q, x_scales = _asm_fp4_prequantized_input(x)
+                x_q, x_scales = _asm_fp4_prequantized_input(
+                    x, in_features=layer.weight.shape[-1] * 2
+                )
             else:
                 if x.dim() == 3:
                     output_shape = [*x.shape[:-1], layer.weight.shape[0]]

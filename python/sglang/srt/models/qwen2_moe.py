@@ -95,6 +95,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import (
     get_exec,
+    get_forward,
     get_parallel,
     get_stream,
 )
@@ -208,6 +209,9 @@ class Qwen2MoeMLP(nn.Module):
         # fused path replaces act_fn + the down_proj input quantization with a
         # single kernel and hands down_proj a prequantized (fp4, scale) tuple.
         self._enable_silu_fp4_quant_fusion = False
+        # Set externally (see qwen3_5.py) on ROCm when both projections are
+        # Quark MXFP4: one AITER kernel does SiLU+mul+MXFP4 quant for down_proj.
+        self._enable_silu_mxfp4_quant_fusion = False
         self._masked_m_cache: dict = {}
         # Lazily derived after weight load (input_scale_inv does not exist yet
         # at construction time); the fused kernel requires a 1-D global scale.
@@ -239,11 +243,44 @@ class Qwen2MoeMLP(nn.Module):
         y_sf = y_sf.view(torch.uint8).permute(2, 4, 0, 1, 3, 5).reshape(m_padded, -1)
         return y_fp4, y_sf
 
+    def _silu_mxfp4_quant_applies(self, gate_up) -> bool:
+        return (
+            self._enable_silu_mxfp4_quant_fusion
+            and not isinstance(gate_up, tuple)
+            and gate_up.dim() == 2
+            and gate_up.shape[0] > 0
+            # The AITER Triton GEMM path reads row-major scales; only the ASM
+            # GEMM takes this producer's swizzled ones.
+            and getattr(self.down_proj, "use_aiter_asm_fp4_gemm", False)
+            and not torch.compiler.is_compiling()
+            and not get_forward().sp_active
+        )
+
+    def _silu_mxfp4_quant_fused(self, gate_up: torch.Tensor):
+        from aiter.ops.triton.activation import act_mul_and_mxfp4_quant
+
+        from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
+            AsmMxfp4Input,
+        )
+
+        # "ceil" is per_1x32_f4_quant's RoundUp scale; AITER releases that ignore
+        # scaling_mode fall back to "even" (valid MXFP4, not bit-identical).
+        # shuffle=True pads the scales to 256 rows in gemm_a4w4's tile order.
+        y_fp4, y_scale = act_mul_and_mxfp4_quant(
+            gate_up, "silu", scaling_mode="ceil", shuffle=True
+        )
+        return AsmMxfp4Input(
+            y_fp4.view(torch.float4_e2m1fn_x2), y_scale.view(torch.float8_e8m0fnu)
+        )
+
     def forward(
         self,
         x,
     ):
         gate_up, _ = self.gate_up_proj(x)
+        if self._silu_mxfp4_quant_applies(gate_up):
+            x, _ = self.down_proj(self._silu_mxfp4_quant_fused(gate_up))
+            return x
         if self._enable_silu_fp4_quant_fusion and not isinstance(gate_up, tuple):
             x, _ = self.down_proj(self._silu_fp4_quant_fused(gate_up))
             return x

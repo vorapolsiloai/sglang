@@ -944,6 +944,10 @@ class Envs:
     # Quark MXFP4 dense linear on gfx95: use AITER's preshuffled ASM/CK FP4 GEMM
     # (shared a4w4 tuned CSVs) instead of the Triton gemm_afp4wfp4 path.
     SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM = EnvBool(False)
+    # Kill switches for the producers that hand those ASM FP4 GEMMs their input
+    # already quantized: Qwen3.5 Gemma add+RMSNorm, and dense-MLP SiLU+mul.
+    SGLANG_ROCM_DISABLE_NORM_MXFP4_QUANT_FUSION = EnvBool(False)
+    SGLANG_DISABLE_SILU_MXFP4_QUANT_FUSION = EnvBool(False)
     # Fold the KDA [f_a|b] tail into the wide [q,k,v,g] projection so the whole
     # in-proj is one GEMM. Decode is bandwidth bound there, so the 144 extra
     # output columns ride along nearly free.

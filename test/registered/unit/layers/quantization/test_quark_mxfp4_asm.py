@@ -11,6 +11,7 @@ import torch
 
 from sglang.srt.layers.quantization.quark.schemes import quark_w4a4_mxfp4
 from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
+    AsmMxfp4Input,
     _asm_fp4_prequantized_input,
     _asm_fp4_scale_swizzle_supported,
     _shuffle_asm_fp4_act_scale,
@@ -87,6 +88,91 @@ class TestQuarkMxfp4AsmTupleInput(CustomTestCase):
         for fused in ((x_q, x_scales, torch.empty(0)), (x_q,) * 5):
             with self.assertRaises(NotImplementedError):
                 _asm_fp4_prequantized_input(fused)
+
+
+def _aiter_triton_shuffle_offsets(rows, cols):
+    """Flat scale offsets written by AITER's Triton MXFP4 quant kernels with
+    shuffle=True (_act_mul_and_dynamic_mxfp4_quant_kernel, SHUFFLE branch)."""
+    r = torch.arange(rows).view(-1, 1)
+    c = torch.arange(cols).view(1, -1)
+    r0, r1, r2 = r // 32, (r % 32) // 16, (r % 32) % 16
+    c3, c4, c5 = c // 8, (c % 8) // 4, (c % 8) % 4
+    return r1 + c4 * 2 + r2 * 4 + c5 * 64 + c3 * 256 + r0 * 32 * cols
+
+
+class TestQuarkMxfp4AsmMarkerInput(CustomTestCase):
+    """AsmMxfp4Input carries scales already in gemm_a4w4's layout; the scheme
+    must use them as-is instead of swizzling them a second time."""
+
+    M, K = 3, 512
+
+    def _marker(self, m=M, k=K, rows=None, cols=None, x_dtype=torch.uint8):
+        rows = (m + 255) // 256 * 256 if rows is None else rows
+        cols = k // 32 if cols is None else cols
+        x_q = torch.zeros((m, k // 2), dtype=x_dtype)
+        x_scales = torch.randint(0, 0x7F, (rows, cols), dtype=torch.uint8)
+        return AsmMxfp4Input(x_q, x_scales)
+
+    def test_producer_shuffle_layout_matches_scheme_swizzle(self):
+        # Layout contract: the AITER producers' shuffled scales are exactly
+        # _swizzle_asm_fp4_scale of the row-major scales.
+        rows, cols = 256, 16
+        scale = torch.randint(0, 256, (rows, cols), dtype=torch.uint8)
+        produced = torch.empty(rows * cols, dtype=torch.uint8)
+        produced[_aiter_triton_shuffle_offsets(rows, cols).flatten()] = scale.flatten()
+        torch.testing.assert_close(
+            produced.view(rows, cols), _swizzle_asm_fp4_scale(scale), rtol=0, atol=0
+        )
+
+    def test_marker_is_passed_through_without_reswizzle(self):
+        marker = self._marker()
+        a, a_scales = _asm_fp4_prequantized_input(marker, in_features=self.K)
+        self.assertEqual(a.dtype, torch.float4_e2m1fn_x2)
+        self.assertEqual(a_scales.dtype, torch.float8_e8m0fnu)
+        self.assertEqual(a.data_ptr(), marker.x_fp4.data_ptr())
+        self.assertEqual(a_scales.data_ptr(), marker.x_scales.data_ptr())
+        torch.testing.assert_close(
+            a_scales.view(torch.uint8), marker.x_scales, rtol=0, atol=0
+        )
+
+    def test_plain_tuple_is_still_reswizzled(self):
+        x_q = torch.zeros((self.M, self.K // 2), dtype=torch.uint8)
+        x_scales = torch.randint(0, 0x7F, (self.M, self.K // 32), dtype=torch.uint8)
+        _, a_scales = _asm_fp4_prequantized_input((x_q, x_scales))
+        torch.testing.assert_close(
+            a_scales, _shuffle_asm_fp4_act_scale(x_scales), rtol=0, atol=0
+        )
+
+    def test_marker_validation(self):
+        m, k = self.M, self.K
+        x_q = torch.zeros((m, k // 2), dtype=torch.uint8)
+        good = torch.zeros((256, k // 32), dtype=torch.uint8)
+        bad = {
+            "row-major scales": self._marker(rows=m),
+            "unpadded scale cols": self._marker(cols=k // 32 - 8),
+            "bf16 activation": self._marker(x_dtype=torch.bfloat16),
+            "3D activation": AsmMxfp4Input(x_q.view(1, m, -1), good),
+            "non-contiguous scales": AsmMxfp4Input(
+                x_q, torch.zeros((k // 32, 256), dtype=torch.uint8).t()
+            ),
+            "K not a multiple of 256": self._marker(k=128),
+        }
+        for name, marker in bad.items():
+            with self.subTest(name), self.assertRaises(ValueError):
+                _asm_fp4_prequantized_input(marker)
+        with self.assertRaises(ValueError):
+            _asm_fp4_prequantized_input(self._marker(), in_features=2 * k)
+        # M on a 256-row boundary needs no extra tile.
+        _asm_fp4_prequantized_input(self._marker(m=256), in_features=k)
+
+    def test_non_asm_layer_rejects_marker(self):
+        scheme = quark_w4a4_mxfp4.QuarkW4A4MXFP4({}, {})
+        for attrs in ({"use_aiter_asm_fp4_gemm": False}, {"dequantized_bf16": True}):
+            layer = torch.nn.Module()
+            for name, value in attrs.items():
+                setattr(layer, name, value)
+            with self.subTest(attrs), self.assertRaises(TypeError):
+                scheme.apply_weights(layer, self._marker())
 
 
 class TestQuarkMxfp4AsmNarrowLayer(CustomTestCase):
