@@ -43,6 +43,11 @@ def _row_major_scale(scale, m):
     )
 
 
+def _rel_fro(out, ref):
+    """Relative Frobenius distance between two GEMM outputs."""
+    return ((out - ref).norm() / ref.norm()).item()
+
+
 def _dequant(x_q, scale, values):
     """fp4x2 codes and swizzled E8M0 scales to float32, plus per-element scales."""
     m, k_packed = x_q.shape
@@ -138,13 +143,11 @@ class TestMxfp4AsmProducersGpu(CustomTestCase):
                 # Only bf16 rounding of the norm output separates the two.
                 self.assertGreaterEqual(scale_match, 0.99)
                 self.assertGreaterEqual(code_match, 0.98)
+                # The two inputs round ~1.5% of the codes differently, so the
+                # outputs are compared as a whole, not elementwise.
                 ref_out = self.scheme.apply_weights(self.up, y).float()
-                torch.testing.assert_close(
-                    self.scheme.apply_weights(self.up, out).float(),
-                    ref_out,
-                    rtol=2e-2,
-                    atol=2e-2 * ref_out.abs().max().item(),
-                )
+                out_gemm = self.scheme.apply_weights(self.up, out).float()
+                self.assertLess(_rel_fro(out_gemm, ref_out), 0.06, f"norm m={m}")
 
     def test_silu_producer_matches_unfused(self):
         from aiter.ops.triton import activation
@@ -170,12 +173,10 @@ class TestMxfp4AsmProducersGpu(CustomTestCase):
                     self.assertGreaterEqual(scale_match, 0.99)
                     self.assertGreaterEqual(code_match, 0.98)
                 ref_out = self.scheme.apply_weights(self.down, y).float()
-                torch.testing.assert_close(
-                    self.scheme.apply_weights(self.down, out).float(),
-                    ref_out,
-                    rtol=5e-2,
-                    atol=5e-2 * ref_out.abs().max().item(),
-                )
+                out_gemm = self.scheme.apply_weights(self.down, out).float()
+                # "even" scales differ from RoundUp on ~22% of the blocks.
+                bound = 0.06 if roundup else 0.15
+                self.assertLess(_rel_fro(out_gemm, ref_out), bound, f"silu m={m}")
 
 
 if __name__ == "__main__":

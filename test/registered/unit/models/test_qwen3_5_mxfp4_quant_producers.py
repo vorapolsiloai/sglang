@@ -88,7 +88,10 @@ class TestGemmaRMSNormMxfp4Selection(CustomTestCase):
             self.assertIs(type(norm), GemmaRMSNorm)
 
     def test_plain_norm_without_aiter_kernel(self):
-        with _on_gfx95(), mock.patch.dict(sys.modules, {"aiter": None}):
+        # Block the submodule too: on a ROCm host aiter.ops.rmsnorm may already
+        # be imported, and a cached submodule bypasses sys.modules["aiter"].
+        no_aiter = {"aiter": None, "aiter.ops": None, "aiter.ops.rmsnorm": None}
+        with _on_gfx95(), mock.patch.dict(sys.modules, no_aiter):
             norm = self._norm_for(_mxfp4_linear())
         self.assertIs(type(norm), GemmaRMSNorm)
 
@@ -139,7 +142,14 @@ class TestGemmaRMSNormMxfp4Forward(CustomTestCase):
             "consumer declines the batch": ((x, residual), False),
         }
         for name, (args, consumes) in cases.items():
-            with self.subTest(name):
+            # CPU tensors: keep the bf16 fallback on torch math even on a ROCm
+            # host with SGLANG_USE_AITER=1 (its Triton Gemma norm needs GPU).
+            with (
+                self.subTest(name),
+                mock.patch.object(
+                    GemmaRMSNorm, "forward_hip", GemmaRMSNorm.forward_native
+                ),
+            ):
                 norm, calls = self._norm(lambda num_tokens, c=consumes: c)
                 out = norm.forward_hip(*args)
                 out = out[0] if isinstance(out, tuple) else out
