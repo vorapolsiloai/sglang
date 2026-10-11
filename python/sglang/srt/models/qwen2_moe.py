@@ -18,6 +18,8 @@
 # https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/qwen2_moe.py
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 
+import functools
+import inspect
 import logging
 from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
@@ -169,6 +171,11 @@ def can_fuse_shared_expert(
     return True
 
 
+@functools.lru_cache(maxsize=None)
+def _accepts_kwarg(fn, name: str) -> bool:
+    return name in inspect.signature(fn).parameters
+
+
 class Qwen2MoeMLP(nn.Module):
     def __init__(
         self,
@@ -263,12 +270,16 @@ class Qwen2MoeMLP(nn.Module):
             AsmMxfp4Input,
         )
 
-        # "ceil" is per_1x32_f4_quant's RoundUp scale; AITER releases that ignore
-        # scaling_mode fall back to "even" (valid MXFP4, not bit-identical).
+        # "ceil" is per_1x32_f4_quant's RoundUp scale and round_to_input_dtype
+        # quantizes bf16(bf16(silu(gate)) * up), what SiluAndMul writes: with
+        # both, the output equals SiluAndMul + per_1x32_f4_quant bit for bit.
+        # AITER releases without them quantize the fp32 product, with "even"
+        # scales if they ignore scaling_mode (valid MXFP4, not bit-identical).
         # shuffle=True pads the scales to 256 rows in gemm_a4w4's tile order.
-        y_fp4, y_scale = act_mul_and_mxfp4_quant(
-            gate_up, "silu", scaling_mode="ceil", shuffle=True
-        )
+        kwargs = {"scaling_mode": "ceil", "shuffle": True}
+        if _accepts_kwarg(act_mul_and_mxfp4_quant, "round_to_input_dtype"):
+            kwargs["round_to_input_dtype"] = True
+        y_fp4, y_scale = act_mul_and_mxfp4_quant(gate_up, "silu", **kwargs)
         return AsmMxfp4Input(
             y_fp4.view(torch.float4_e2m1fn_x2), y_scale.view(torch.float8_e8m0fnu)
         )

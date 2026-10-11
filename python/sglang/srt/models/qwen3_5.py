@@ -245,10 +245,11 @@ def _maybe_enable_silu_mxfp4_quant_fusion(mlp: nn.Module) -> None:
     SGLANG_DISABLE_SILU_MXFP4_QUANT_FUSION=1.
 
     Numerics: the producer asks for scaling_mode="ceil" (RoundUp, as in
-    per_1x32_f4_quant). AITER releases that ignore scaling_mode use Quark
-    "even" rounding instead: a valid MXFP4 input, not bit-identical to the
-    unfused one.
-    TODO(vorapolsiloai): link the AITER PR that honours scaling_mode="ceil".
+    per_1x32_f4_quant) and, where AITER has it, round_to_input_dtype=True;
+    with both its output is bit-identical to SiluAndMul + per_1x32_f4_quant.
+    Older AITER quantizes the fp32 product, with Quark "even" scales if it
+    ignores scaling_mode: a valid MXFP4 input, not bit-identical.
+    TODO(vorapolsiloai): link the AITER PR that adds both.
     """
     if not _is_hip or envs.SGLANG_DISABLE_SILU_MXFP4_QUANT_FUSION.get():
         return
@@ -285,18 +286,22 @@ def _mxfp4_asm_input(linear: Optional[nn.Module], num_tokens: int) -> bool:
 class _GemmaRMSNormMXFP4Quant(GemmaRMSNorm):
     """Gemma add+RMSNorm that also MXFP4-quantizes its output.
 
-    One AITER kernel adds the residual, normalizes and writes fp4x2 with
+    One Triton kernel adds the residual, normalizes and writes fp4x2 with
     swizzled E8M0 scales (an AsmMxfp4Input), replacing the add+norm kernel and
-    the consumer's per_1x32_f4_quant. ``consumes_mxfp4(num_tokens)`` decides
-    per batch, since the ASM GEMM is chosen after weight loading; without a
-    residual (first layer) or with a post-residual addition the bf16 norm runs.
+    the consumer's per_1x32_f4_quant bit for bit: it is the ROCm Gemma norm
+    kernel of the bf16 path with a quant epilogue. ``consumes_mxfp4(num_tokens)``
+    decides per batch, since the ASM GEMM is chosen after weight loading;
+    without a residual (first layer) or with a post-residual addition the bf16
+    norm runs.
     """
 
     def __init__(self, hidden_size: int, eps: float, consumes_mxfp4) -> None:
         super().__init__(hidden_size, eps=eps)
-        from aiter.ops.rmsnorm import add_rmsnorm_quant
+        from sglang.kernels.ops.layernorm.minimax_m3_rmsnorm import (
+            gemma_fused_add_rmsnorm_mxfp4_quant,
+        )
 
-        self._add_rmsnorm_quant = add_rmsnorm_quant
+        self._norm_quant = gemma_fused_add_rmsnorm_mxfp4_quant
         self._consumes_mxfp4 = consumes_mxfp4
 
     def forward_hip(
@@ -314,30 +319,17 @@ class _GemmaRMSNormMXFP4Quant(GemmaRMSNorm):
             and residual.is_contiguous()
             and self._consumes_mxfp4(x.shape[0])
         ):
-            m, k = x.shape
-            x_q = torch.empty(m, k // 2, dtype=torch.float4_e2m1fn_x2, device=x.device)
-            # Scale rows padded to the 256-row tiles the ASM GEMM reads.
-            x_scales = torch.empty(
-                (m + 255) // 256 * 256,
-                k // 32,
-                dtype=torch.float8_e8m0fnu,
-                device=x.device,
+            # Scale rows come padded to the 256-row tiles the ASM GEMM reads.
+            x_q, x_scales, residual_out = self._norm_quant(
+                x, residual, self.weight.data, self.variance_epsilon
             )
-            residual_out = torch.empty_like(x)
-            # group_size=32, shuffle_scale=True, gemma_norm=True (1 + weight).
-            self._add_rmsnorm_quant(
-                x_q,
-                x,
-                residual,
+            return (
+                AsmMxfp4Input(
+                    x_q.view(torch.float4_e2m1fn_x2),
+                    x_scales.view(torch.float8_e8m0fnu),
+                ),
                 residual_out,
-                x_scales,
-                self.weight.data,
-                self.variance_epsilon,
-                32,
-                True,
-                True,
             )
-            return AsmMxfp4Input(x_q, x_scales), residual_out
         return super().forward_hip(x, residual, post_residual_addition)
 
 
@@ -345,15 +337,14 @@ def _gemma_rms_norm_for(
     config: Qwen3_5TextConfig, consumer: Optional[nn.Module], consumes_mxfp4
 ) -> GemmaRMSNorm:
     """The Gemma RMSNorm in front of ``consumer``: _GemmaRMSNormMXFP4Quant on
-    ROCm/AITER gfx95 when the consumer is Quark W4A4 MXFP4, else GemmaRMSNorm.
+    ROCm/AITER gfx95 when the consumer is Quark W4A4 MXFP4 and the bf16 path
+    runs the ROCm Triton Gemma norm, else GemmaRMSNorm.
     Kill switch: SGLANG_ROCM_DISABLE_NORM_MXFP4_QUANT_FUSION=1."""
     hidden_size, eps = config.hidden_size, config.rms_norm_eps
     if (
         not (_use_aiter and _is_gfx95)
         or envs.SGLANG_ROCM_DISABLE_NORM_MXFP4_QUANT_FUSION.get()
-        # The AITER kernel covers hidden sizes up to 8192; the ASM GEMM reads
-        # K in multiples of 256.
-        or hidden_size > 8192
+        # The ASM GEMM reads K in multiples of 256.
         or hidden_size % 256 != 0
         or not isinstance(getattr(consumer, "scheme", None), QuarkW4A4MXFP4)
     ):

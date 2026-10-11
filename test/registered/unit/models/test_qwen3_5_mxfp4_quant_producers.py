@@ -1,6 +1,6 @@
 """CPU tests for the Qwen3.5 MXFP4 quant producers (ROCm/AITER): selection,
 kill switches and fallbacks of the fused Gemma add+RMSNorm+MXFP4 norm and the
-dense-MLP SiLU+mul+MXFP4 path. AITER kernels are faked; numerics are covered
+dense-MLP SiLU+mul+MXFP4 path. The kernels are faked; numerics are covered
 by test_quark_mxfp4_asm_producers_gpu.py."""
 
 import sys
@@ -42,6 +42,19 @@ def _fake_aiter(**ops):
     return mock.patch.dict(sys.modules, modules)
 
 
+_NORM_KERNEL_MODULE = "sglang.kernels.ops.layernorm.minimax_m3_rmsnorm"
+
+
+def _fake_norm_kernel(fn=print):
+    """sys.modules entry for the Triton norm kernel module with ``fn`` as
+    gemma_fused_add_rmsnorm_mxfp4_quant (``None`` blocks the import)."""
+    module = None
+    if fn is not None:
+        module = types.ModuleType(_NORM_KERNEL_MODULE)
+        module.gemma_fused_add_rmsnorm_mxfp4_quant = fn
+    return mock.patch.dict(sys.modules, {_NORM_KERNEL_MODULE: module})
+
+
 def _mxfp4_linear(use_asm=True):
     linear = nn.Module()
     linear.scheme = QuarkW4A4MXFP4({}, {})
@@ -62,7 +75,7 @@ class TestGemmaRMSNormMxfp4Selection(CustomTestCase):
         )
 
     def test_mxfp4_consumer_gets_fused_norm(self):
-        with _on_gfx95(), _fake_aiter(**{"ops.rmsnorm.add_rmsnorm_quant": print}):
+        with _on_gfx95(), _fake_norm_kernel():
             norm = self._norm_for(_mxfp4_linear())
         self.assertIsInstance(norm, qwen3_5._GemmaRMSNormMXFP4Quant)
 
@@ -81,17 +94,14 @@ class TestGemmaRMSNormMxfp4Selection(CustomTestCase):
             with (
                 self.subTest(name),
                 _on_gfx95(),
-                _fake_aiter(**{"ops.rmsnorm.add_rmsnorm_quant": print}),
+                _fake_norm_kernel(),
                 envs.SGLANG_ROCM_DISABLE_NORM_MXFP4_QUANT_FUSION.override(kill),
             ):
                 norm = self._norm_for(consumer, config)
             self.assertIs(type(norm), GemmaRMSNorm)
 
-    def test_plain_norm_without_aiter_kernel(self):
-        # Block the submodule too: on a ROCm host aiter.ops.rmsnorm may already
-        # be imported, and a cached submodule bypasses sys.modules["aiter"].
-        no_aiter = {"aiter": None, "aiter.ops": None, "aiter.ops.rmsnorm": None}
-        with _on_gfx95(), mock.patch.dict(sys.modules, no_aiter):
+    def test_plain_norm_without_triton_kernel(self):
+        with _on_gfx95(), _fake_norm_kernel(None):
             norm = self._norm_for(_mxfp4_linear())
         self.assertIs(type(norm), GemmaRMSNorm)
 
@@ -106,10 +116,16 @@ class TestGemmaRMSNormMxfp4Forward(CustomTestCase):
     def _norm(self, consumes):
         calls = []
 
-        def add_rmsnorm_quant(*args):
-            calls.append(args)
+        def norm_quant(x, residual, weight, eps):
+            calls.append((x, residual, weight, eps))
+            m, n = x.shape
+            return (
+                torch.zeros(m, n // 2, dtype=torch.uint8),
+                torch.zeros((m + 255) // 256 * 256, n // 32, dtype=torch.uint8),
+                torch.empty_like(x),
+            )
 
-        with _fake_aiter(**{"ops.rmsnorm.add_rmsnorm_quant": add_rmsnorm_quant}):
+        with _fake_norm_kernel(norm_quant):
             norm = qwen3_5._GemmaRMSNormMXFP4Quant(_HIDDEN, 1e-6, consumes)
         norm.weight.data = norm.weight.data.bfloat16()
         return norm, calls
@@ -128,11 +144,11 @@ class TestGemmaRMSNormMxfp4Forward(CustomTestCase):
         self.assertEqual(out.x_scales.dtype, torch.float8_e8m0fnu)
         self.assertEqual(tuple(out.x_scales.shape), (256, _HIDDEN // 32))
         self.assertEqual(residual_out.shape, x.shape)
-        (args,) = calls
-        # group_size=32, shuffle_scale=True, gemma_norm=True
-        self.assertEqual(args[-3:], (32, True, True))
-        self.assertIs(args[1], x)
-        self.assertIs(args[2], residual)
+        ((x_in, residual_in, weight, eps),) = calls
+        self.assertIs(x_in, x)
+        self.assertIs(residual_in, residual)
+        self.assertEqual(weight.data_ptr(), norm.weight.data_ptr())
+        self.assertEqual(eps, 1e-6)
 
     def test_falls_back_to_bf16_norm(self):
         x, residual = self._inputs()
@@ -193,17 +209,7 @@ class TestSiluMxfp4Producer(CustomTestCase):
         mlp.down_proj.use_aiter_asm_fp4_gemm = False
         self.assertFalse(Qwen2MoeMLP._silu_mxfp4_quant_applies(mlp, gate_up))
 
-    def test_producer_requests_roundup_and_shuffled_scales(self):
-        calls = []
-
-        def act_mul_and_mxfp4_quant(x, activation, **kwargs):
-            calls.append((activation, kwargs))
-            m, n = x.shape
-            return (
-                torch.zeros(m, n // 4, dtype=torch.uint8),
-                torch.zeros(256, n // 64, dtype=torch.uint8),
-            )
-
+    def _produce(self, act_mul_and_mxfp4_quant):
         gate_up = torch.zeros(3, 1024, dtype=torch.bfloat16)
         with _fake_aiter(
             **{"ops.triton.activation.act_mul_and_mxfp4_quant": act_mul_and_mxfp4_quant}
@@ -212,7 +218,36 @@ class TestSiluMxfp4Producer(CustomTestCase):
         self.assertIsInstance(out, AsmMxfp4Input)
         self.assertEqual(out.x_fp4.dtype, torch.float4_e2m1fn_x2)
         self.assertEqual(out.x_scales.dtype, torch.float8_e8m0fnu)
+
+    @staticmethod
+    def _outputs(x):
+        m, n = x.shape
+        return (
+            torch.zeros(m, n // 4, dtype=torch.uint8),
+            torch.zeros(256, n // 64, dtype=torch.uint8),
+        )
+
+    def test_producer_requests_roundup_and_shuffled_scales(self):
+        calls = []
+
+        def act_mul_and_mxfp4_quant(x, activation, **kwargs):
+            calls.append((activation, kwargs))
+            return self._outputs(x)
+
+        self._produce(act_mul_and_mxfp4_quant)
         self.assertEqual(calls, [("silu", {"scaling_mode": "ceil", "shuffle": True})])
+
+    def test_producer_rounds_like_silu_and_mul_when_aiter_can(self):
+        calls = []
+
+        def act_mul_and_mxfp4_quant(
+            x, activation, scaling_mode="even", shuffle=False, round_to_input_dtype=False
+        ):
+            calls.append((activation, scaling_mode, shuffle, round_to_input_dtype))
+            return self._outputs(x)
+
+        self._produce(act_mul_and_mxfp4_quant)
+        self.assertEqual(calls, [("silu", "ceil", True, True)])
 
 
 class TestFusedArInputSelection(CustomTestCase):

@@ -1,8 +1,11 @@
 """gfx950 tests for the MXFP4 quant producers that feed the AITER ASM FP4 GEMM
 an AsmMxfp4Input: the marker path against the scheme's own quantization, the
 fused Gemma add+RMSNorm+MXFP4 norm and the fused SiLU+mul+MXFP4 MLP producer
-against their unfused bf16 + per_1x32_f4_quant references."""
+against the unfused bf16 path they replace (GemmaRMSNorm / SiluAndMul, then
+per_1x32_f4_quant): bit-identical (the SiLU producer with an AITER that has
+round_to_input_dtype)."""
 
+import inspect
 import unittest
 from unittest import mock
 
@@ -43,6 +46,15 @@ def _row_major_scale(scale, m):
     )
 
 
+def _edge_rows(x):
+    """Rows of ``x`` with all-zero, tiny (< 1e-10) and large 32-wide blocks."""
+    x = x.clone()
+    x[0, :64] = 0
+    x[-1, 32:64] = 1e-12
+    x[-1, 64:96] *= 1e4
+    return x
+
+
 def _rel_fro(out, ref):
     """Relative Frobenius distance between two GEMM outputs."""
     return ((out - ref).norm() / ref.norm()).item()
@@ -74,6 +86,25 @@ class TestMxfp4AsmProducersGpu(CustomTestCase):
         with mock.patch.object(quark_w4a4_mxfp4, "_use_aiter_asm_fp4_gemm", True):
             cls.up = _asm_layer(cls.scheme, 1024, _HIDDEN, gen)
             cls.down = _asm_layer(cls.scheme, _HIDDEN, _INTERMEDIATE, gen)
+
+    def _assert_bit_identical(self, fused, ref_input, name):
+        """``fused`` equals per_1x32_f4_quant(ref_input) byte for byte, and so
+        do the ASM GEMM outputs."""
+        m = ref_input.shape[0]
+        ref = self.q.AsmMxfp4Input(*self.q.per_1x32_f4_quant(ref_input))
+        self.assertTrue(
+            torch.equal(fused.x_fp4.view(torch.uint8), ref.x_fp4.view(torch.uint8)),
+            f"{name}: fp4 bytes differ",
+        )
+        self.assertEqual(fused.x_scales.shape, ref.x_scales.shape, name)
+        self.assertTrue(
+            torch.equal(
+                _row_major_scale(fused.x_scales, m),
+                _row_major_scale(ref.x_scales.view(torch.uint8), m),
+            ),
+            f"{name}: scales differ",
+        )
+        return ref
 
     def _compare_quant(self, fused, ref_input, y_true, name, roundup=True):
         """``fused`` vs per_1x32_f4_quant(ref_input): with RoundUp scales, within
@@ -125,59 +156,84 @@ class TestMxfp4AsmProducersGpu(CustomTestCase):
         fused_norm = _GemmaRMSNormMXFP4Quant(_HIDDEN, 1e-6, lambda num_tokens: True)
         ref_norm = GemmaRMSNorm(_HIDDEN, eps=1e-6)
         weight = 0.1 * torch.randn(_HIDDEN, dtype=torch.bfloat16)
+        weight[:64] = -1.0  # (1 + weight) == 0: all-zero output blocks
         for norm in (fused_norm, ref_norm):
             norm.to("cuda", torch.bfloat16)
             norm.weight.data.copy_(weight)
         for m in _BATCHES:
-            with self.subTest(m=m):
-                x = torch.randn(m, _HIDDEN, dtype=torch.bfloat16, device="cuda")
-                residual = torch.randn_like(x)
-                out, residual_out = fused_norm.forward_hip(x.clone(), residual.clone())
-                self.assertIsInstance(out, self.q.AsmMxfp4Input)
-                y, residual_ref = ref_norm.forward_hip(x.clone(), residual.clone())
-                torch.testing.assert_close(residual_out, residual_ref, rtol=0, atol=0)
-                y_true = ref_norm.forward_native(x.float(), residual.float())[0]
-                code_match, scale_match = self._compare_quant(
-                    out, y, y_true, f"norm m={m}"
-                )
-                # Only bf16 rounding of the norm output separates the two.
-                self.assertGreaterEqual(scale_match, 0.99)
-                self.assertGreaterEqual(code_match, 0.98)
-                # The two inputs round ~1.5% of the codes differently, so the
-                # outputs are compared as a whole, not elementwise.
-                ref_out = self.scheme.apply_weights(self.up, y).float()
-                out_gemm = self.scheme.apply_weights(self.up, out).float()
-                self.assertLess(_rel_fro(out_gemm, ref_out), 0.06, f"norm m={m}")
+            for edge in (False, True):
+                with self.subTest(m=m, edge=edge):
+                    x = torch.randn(m, _HIDDEN, dtype=torch.bfloat16, device="cuda")
+                    residual = torch.randn_like(x)
+                    if edge:
+                        x, residual = _edge_rows(x), _edge_rows(residual)
+                    out, residual_out = fused_norm.forward_hip(
+                        x.clone(), residual.clone()
+                    )
+                    self.assertIsInstance(out, self.q.AsmMxfp4Input)
+                    y, residual_ref = ref_norm.forward_hip(x.clone(), residual.clone())
+                    torch.testing.assert_close(
+                        residual_out, residual_ref, rtol=0, atol=0
+                    )
+                    # The producer is the bf16 path's norm kernel with a quant
+                    # epilogue: bit-identical, down to the GEMM output.
+                    ref = self._assert_bit_identical(out, y, f"norm m={m}")
+                    torch.testing.assert_close(
+                        self.scheme.apply_weights(self.up, out),
+                        self.scheme.apply_weights(self.up, ref),
+                        rtol=0,
+                        atol=0,
+                    )
 
     def test_silu_producer_matches_unfused(self):
         from aiter.ops.triton import activation
 
+        from sglang.srt.layers.activation import SiluAndMul
         from sglang.srt.models.qwen2_moe import Qwen2MoeMLP
 
-        # AITER honours scaling_mode="ceil" (RoundUp, as per_1x32_f4_quant) only
-        # after the follow-up PR; before it the producer rounds the "even" way.
+        # AITER honours scaling_mode="ceil" (RoundUp, as per_1x32_f4_quant) and
+        # round_to_input_dtype only after the follow-up PR; before it the
+        # producer quantizes the fp32 product, with "even" scales if "ceil" is
+        # not known.
         roundup = "ceil" in getattr(activation, "_MXFP4_SCALING_MODES", {})
+        exact = roundup and "round_to_input_dtype" in (
+            inspect.signature(activation.act_mul_and_mxfp4_quant).parameters
+        )
+        silu_and_mul = SiluAndMul()
         for m in _BATCHES:
-            with self.subTest(m=m):
-                gate_up = torch.randn(
-                    m, 2 * _INTERMEDIATE, dtype=torch.bfloat16, device="cuda"
-                )
-                out = Qwen2MoeMLP._silu_mxfp4_quant_fused(None, gate_up)
-                gate, up = gate_up.float().chunk(2, dim=-1)
-                y_true = F.silu(gate) * up
-                y = y_true.bfloat16()
-                code_match, scale_match = self._compare_quant(
-                    out, y, y_true, f"silu m={m} roundup={roundup}", roundup
-                )
-                if roundup:
-                    self.assertGreaterEqual(scale_match, 0.99)
-                    self.assertGreaterEqual(code_match, 0.98)
-                ref_out = self.scheme.apply_weights(self.down, y).float()
-                out_gemm = self.scheme.apply_weights(self.down, out).float()
-                # "even" scales differ from RoundUp on ~22% of the blocks.
-                bound = 0.06 if roundup else 0.15
-                self.assertLess(_rel_fro(out_gemm, ref_out), bound, f"silu m={m}")
-
+            for edge in (False, True):
+                with self.subTest(m=m, edge=edge):
+                    gate_up = torch.randn(
+                        m, 2 * _INTERMEDIATE, dtype=torch.bfloat16, device="cuda"
+                    )
+                    if edge:
+                        gate_up = _edge_rows(gate_up)
+                    out = Qwen2MoeMLP._silu_mxfp4_quant_fused(None, gate_up)
+                    # What the unfused path quantizes: SiluAndMul's bf16 output.
+                    y = silu_and_mul(gate_up)
+                    name = f"silu m={m} roundup={roundup} exact={exact}"
+                    if exact:
+                        ref = self._assert_bit_identical(out, y, name)
+                        torch.testing.assert_close(
+                            self.scheme.apply_weights(self.down, out),
+                            self.scheme.apply_weights(self.down, ref),
+                            rtol=0,
+                            atol=0,
+                        )
+                        continue
+                    gate, up = gate_up.float().chunk(2, dim=-1)
+                    y_true = F.silu(gate) * up
+                    code_match, scale_match = self._compare_quant(
+                        out, y, y_true, name, roundup
+                    )
+                    if roundup:
+                        self.assertGreaterEqual(scale_match, 0.99)
+                        self.assertGreaterEqual(code_match, 0.98)
+                    ref_out = self.scheme.apply_weights(self.down, y).float()
+                    out_gemm = self.scheme.apply_weights(self.down, out).float()
+                    # "even" scales differ from RoundUp on ~22% of the blocks.
+                    bound = 0.06 if roundup else 0.15
+                    self.assertLess(_rel_fro(out_gemm, ref_out), bound, name)
 
 if __name__ == "__main__":
     unittest.main()
