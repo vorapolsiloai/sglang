@@ -14,6 +14,7 @@
 # ==============================================================================
 """Inference-only Qwen3.5 model and Qwen3.5 MoE model compatible with HuggingFace weights."""
 
+import inspect
 import logging
 from functools import lru_cache
 from typing import Iterable, Optional, Set, Tuple, Union
@@ -217,6 +218,45 @@ def _disable_shared_experts_fusion() -> bool:
     # The deferred-finalize ABI needs the shared expert as a separate, gated
     # local contribution; it cannot consume a shared slot fused into routed MoE.
     return bool(uses_cutedsl_ar_fusion() or is_shared_experts_fusion_disabled())
+
+
+def _maybe_enable_silu_mxfp4_quant_fusion(mlp: nn.Module) -> None:
+    """Fuse SiLU+mul with the down_proj MXFP4 input quantization on ROCm.
+
+    Uses aiter's act_mul_and_mxfp4_quant(shuffle=True) in place of the
+    separate act_and_mul and per_1x32_f4_quant kernels, with the same output
+    bit for bit. Enabled when both dense-MLP projections use the Quark W4A4
+    MXFP4 scheme and AITER's kernel can round like SiluAndMul
+    (round_to_input_dtype); the fused path is taken only when down_proj runs
+    the AITER ASM FP4 GEMM (decided after weight loading).
+    """
+    if not _is_hip:
+        return
+    from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
+        QuarkW4A4MXFP4,
+    )
+
+    if not all(
+        isinstance(getattr(proj, "scheme", None), QuarkW4A4MXFP4)
+        for proj in (mlp.gate_up_proj, mlp.down_proj)
+    ):
+        return
+    try:
+        from aiter import dtypes as aiter_dtypes
+        from aiter.ops.triton.fusions.activation import act_mul_and_mxfp4_quant
+    except ImportError:
+        return
+    # Without round_to_input_dtype the kernel quantizes the fp32 silu(gate) * up:
+    # valid MXFP4, but not the input the unfused path gives down_proj.
+    if (
+        "round_to_input_dtype"
+        not in inspect.signature(act_mul_and_mxfp4_quant).parameters
+    ):
+        return
+    mlp._mxfp4_x_dtype = aiter_dtypes.fp4x2
+    mlp._mxfp4_scale_dtype = aiter_dtypes.fp8_e8m0
+    mlp._enable_silu_mxfp4_quant_fusion = True
+    logger.info("Enabled fused SiLU+mul+MXFP4-quant for dense MLP down_proj input.")
 
 
 def _use_mnnvl_cutedsl_fusion(config: Qwen3_5TextConfig, is_nextn: bool) -> bool:
@@ -1182,6 +1222,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 reduce_results=False,
             )
             maybe_enable_silu_fp4_quant_fusion(self.mlp)
+            _maybe_enable_silu_mxfp4_quant_fusion(self.mlp)
         else:
             raise ValueError(f"Invalid model type: {config.model_type}")
 
@@ -1395,6 +1436,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 # The stage boundary completes this stage's sum.
                 reduce_results=False,
             )
+            _maybe_enable_silu_mxfp4_quant_fusion(self.mlp)
         elif _qwen3_5_is_moe(config):
             self.mlp = Qwen2MoeSparseMoeBlock(
                 layer_id=layer_id,
