@@ -1506,6 +1506,21 @@ class AiterAttnBackend(AttentionBackend):
         q_pad[:, : layer.tp_q_head_num, :] = q3
         return q_pad
 
+    def _unified_q_in_kv_dtype(self, q: torch.Tensor, layer: RadixAttention):
+        """Q for ``unified_attention`` in the KV cache dtype, plus its descale.
+
+        aiter's gfx950 Gluon kernel needs q and kv in one dtype; a bf16 Q
+        against an FP8 cache falls back to the Triton kernel, which at page
+        size 1 walks the KV one token per tile. forward_decode quantizes Q the
+        same way. Returns q as (tokens, heads, head_dim).
+        """
+        q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        if self.kv_cache_dtype != fp8_dtype:
+            return q, None
+        q_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
+        q_fp8, _ = scaled_fp8_quant(q.reshape(q.shape[0], -1), q_descale)
+        return q_fp8.view(-1, layer.tp_q_head_num, layer.qk_head_dim), q_descale
+
     def _resolve_fp8_kv_scale_float(self, layer: RadixAttention, k_descale) -> float:
         cached = getattr(layer, "_aiter_kv_scale_float", None)
         if cached is not None:
@@ -4207,22 +4222,9 @@ class AiterAttnBackend(AttentionBackend):
                     # signature num_query_heads_16/num_queries_per_kv_1). GQA head
                     # mapping here is identical to the proven decode path.
 
-                    # With an FP8 KV cache, quantize Q to FP8 as forward_decode and
-                    # the unified-attention extend path do. aiter's gfx950 Gluon kernel
-                    # needs q and kv in one dtype; a bf16 Q against an FP8 cache falls
-                    # back to the Triton kernel, which at page size 1 walks the KV one
-                    # token per tile.
-                    q_descale = None
-                    if self.kv_cache_dtype == fp8_dtype:
-                        q_descale = (
-                            layer.k_scale if layer.k_scale is not None else self.k_scale
-                        )
-                        q_fp8, _ = scaled_fp8_quant(
-                            q_unified.reshape(q_unified.shape[0], -1), q_descale
-                        )
-                        q_unified = q_fp8.view(
-                            -1, layer.tp_q_head_num, layer.qk_head_dim
-                        )
+                    q_unified, q_descale = self._unified_q_in_kv_dtype(
+                        q_unified, layer
+                    )
 
                     # The seq_lens + draft_num add has to run INSIDE the graph
                     # region; a host-side pre-add would allocate a new tensor
@@ -4345,8 +4347,11 @@ class AiterAttnBackend(AttentionBackend):
                     )
                 ):
                     return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+                # The asm kernel above takes bf16 Q; unified_attention wants Q in
+                # the KV dtype.
+                q_de, q_descale = self._unified_q_in_kv_dtype(q, layer)
                 unified_attention(
-                    q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    q=q_de,
                     k=k_cache.view(
                         -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
                     ),
@@ -4363,7 +4368,7 @@ class AiterAttnBackend(AttentionBackend):
                     window_size=de_window,
                     block_table=pt,
                     softcap=layer.logit_cap,
-                    q_descale=None,
+                    q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
                     sinks=sinks,
