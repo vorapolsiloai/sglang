@@ -31,7 +31,6 @@ def _should_auto_enable_hip_rejection_sampling(
     is_hip: bool,
     use_rejection_sampling: bool,
     algorithm: Optional[str],
-    token_map: Optional[str],
     eagle_topk: int,
     accept_threshold_single: float,
     accept_threshold_acc: float,
@@ -40,11 +39,11 @@ def _should_auto_enable_hip_rejection_sampling(
 ) -> bool:
     """Whether HIP may default ``speculative_use_rejection_sampling`` on.
 
-    Rejection sampling still cannot consume a reduced / hot draft vocab
-    (``eagle_worker_v2`` FIXME: scatter via the d2t map). Auto-enabling there
-    would crash configs that previously ran greedy on HIP, including EAGLE3
-    stage-a ``test_basic_sanity_eagle3`` (draft 32000 vs target 128256). Skip
-    EAGLE3 and any EAGLE run that already has a token map.
+    An EAGLE draft with a ``--speculative-token-map`` proposes over a reduced
+    (hot) vocab; the draft worker scatters that proposal into the target vocab
+    before the verify, so it qualifies. EAGLE3 drafts with their own reduced
+    vocab (stage-a ``test_basic_sanity_eagle3``, draft 32000 vs target 128256)
+    stay off: not validated with rejection sampling.
 
     Also skip when ``SGLANG_SIMULATE_ACC_LEN`` is on: AgentX throughput still
     runs the real EAGLE verify then overwrites accept length, so the Triton
@@ -54,7 +53,6 @@ def _should_auto_enable_hip_rejection_sampling(
         is_hip
         and not use_rejection_sampling
         and algorithm == "EAGLE"
-        and token_map is None
         and eagle_topk == 1
         and accept_threshold_single == 1.0
         and accept_threshold_acc == 1.0
@@ -1188,7 +1186,6 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         is_hip=get_platform().is_hip,
         use_rejection_sampling=cfg.speculative_use_rejection_sampling,
         algorithm=cfg.speculative_algorithm,
-        token_map=cfg.speculative_token_map,
         eagle_topk=cfg.speculative_eagle_topk,
         accept_threshold_single=cfg.speculative_accept_threshold_single,
         accept_threshold_acc=cfg.speculative_accept_threshold_acc,

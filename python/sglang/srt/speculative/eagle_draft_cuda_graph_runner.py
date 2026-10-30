@@ -196,9 +196,19 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
             topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
             topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
+            # Draft-vocab width: a reduced (hot) vocab is scattered into the
+            # target vocab only after the last draft step.
+            hot_token_id = self.eagle_worker.hot_token_id
             draft_probs = (
                 torch.zeros(
-                    (self.max_bs, self.model_runner.model_config.vocab_size),
+                    (
+                        self.max_bs,
+                        (
+                            hot_token_id.shape[0]
+                            if hot_token_id is not None
+                            else self.model_runner.model_config.vocab_size
+                        ),
+                    ),
                     dtype=torch.float32,
                 )
                 if get_spec().speculative_use_rejection_sampling

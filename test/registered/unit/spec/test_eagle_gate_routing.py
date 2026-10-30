@@ -86,7 +86,6 @@ def _hip_auto_enable(**overrides):
         is_hip=True,
         use_rejection_sampling=False,
         algorithm="EAGLE",
-        token_map=None,
         eagle_topk=1,
         accept_threshold_single=1.0,
         accept_threshold_acc=1.0,
@@ -103,9 +102,6 @@ class TestHipAutoEnableRejectionSampling(CustomTestCase):
     def test_eagle3_stays_off(self):
         # Reduced hot-token vocab; stage-a test_basic_sanity_eagle3.
         self.assertFalse(_hip_auto_enable(algorithm="EAGLE3"))
-
-    def test_token_map_stays_off(self):
-        self.assertFalse(_hip_auto_enable(token_map="d2t.pt"))
 
     def test_cuda_never_flips(self):
         self.assertFalse(_hip_auto_enable(is_hip=False))

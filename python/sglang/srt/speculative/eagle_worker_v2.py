@@ -257,22 +257,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.init_token_map()
         self.init_lm_head()
 
-        if get_spec().speculative_use_rejection_sampling:
-            target_vocab_size = self.target_worker.model_config.vocab_size
-            draft_vocab_size = (
-                self.hot_token_id.shape[0]
-                if self.hot_token_id is not None
-                else target_vocab_size
-            )
-            # FIXME: support reduced (hot) draft vocab by scattering draft probs
-            # into the target vocab via the d2t map before the sampling kernel.
-            if draft_vocab_size != target_vocab_size:
-                raise ValueError(
-                    "--speculative-use-rejection-sampling requires the draft and "
-                    f"target to share one vocab, but the draft vocab "
-                    f"({draft_vocab_size}) != target vocab ({target_vocab_size})."
-                )
-
     def init_attention_backends(self):
         with (
             draft_pp_context(),
@@ -899,7 +883,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 hidden_states = logits_output.hidden_states
 
         draft_probs = (
-            torch.stack(draft_probs_list, dim=1) if needs_draft_probs else None
+            self._draft_probs_to_target_vocab(torch.stack(draft_probs_list, dim=1))
+            if needs_draft_probs
+            else None
         )
 
         # Organize the results
@@ -921,6 +907,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
 
         return parent_list, top_scores_index, draft_tokens, draft_probs
+
+    def _draft_probs_to_target_vocab(self, draft_probs: torch.Tensor) -> torch.Tensor:
+        """Scatter a reduced (hot) draft vocab proposal into the target vocab.
+
+        The verify reads q at target token ids. A token outside the hot vocab has
+        q = 0, so it is never proposed and is reachable only through the residual
+        (p - q)+, which keeps rejection sampling exact.
+        """
+        if self.hot_token_id is None:
+            return draft_probs
+        target_vocab_probs = draft_probs.new_zeros(
+            (*draft_probs.shape[:-1], self.target_worker.model_config.vocab_size)
+        )
+        target_vocab_probs.index_copy_(-1, self.hot_token_id, draft_probs)
+        return target_vocab_probs
 
     def _draft_forward_idle(
         self, forward_batch: ForwardBatch, spec_info: EagleDraftInput
