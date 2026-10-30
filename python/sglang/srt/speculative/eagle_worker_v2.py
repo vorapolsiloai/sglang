@@ -37,6 +37,7 @@ from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
 )
+from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -372,6 +373,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             if self.hot_token_id is not None and head is not None:
                 head = head.clone()
                 self.hot_token_id = self.hot_token_id.to(head.device)
+                if (
+                    isinstance(target_lm_head, VocabParallelEmbedding)
+                    and target_lm_head.tp_size > 1
+                ):
+                    # Hot ids index the full vocab, so gather the vocab shards;
+                    # the draft head is replicated and its logits skip the TP gather.
+                    head.data = target_lm_head.tp_group.all_gather(head.data, dim=0)
+                    logits_processor = self.draft_runner.model.logits_processor
+                    logits_processor.do_tensor_parallel_all_gather = False
                 head.data = head.data[self.hot_token_id]
 
             # Share the embedding and lm_head
