@@ -79,5 +79,30 @@ class TestEagleDraftSamplingPosition(CustomTestCase):
         )
 
 
+class TestDraftProbsToTargetVocab(CustomTestCase):
+    def _worker(self, hot_token_id, target_vocab_size):
+        worker = EagleDraftWorker.__new__(EagleDraftWorker)
+        worker.hot_token_id = hot_token_id
+        worker.target_worker = SimpleNamespace(
+            model_config=SimpleNamespace(vocab_size=target_vocab_size)
+        )
+        return worker
+
+    def test_hot_vocab_proposal_scattered_to_target_ids(self):
+        hot_token_id = torch.tensor([7, 2, 9], dtype=torch.int64)
+        draft_probs = torch.softmax(torch.randn(2, 3, 3), dim=-1)
+        out = self._worker(hot_token_id, 10)._draft_probs_to_target_vocab(draft_probs)
+
+        self.assertEqual(out.shape, (2, 3, 10))
+        torch.testing.assert_close(out[..., hot_token_id], draft_probs)
+        cold = torch.tensor([0, 1, 3, 4, 5, 6, 8])
+        self.assertTrue(torch.all(out[..., cold] == 0))
+
+    def test_full_vocab_proposal_unchanged(self):
+        draft_probs = torch.softmax(torch.randn(2, 3, 10), dim=-1)
+        out = self._worker(None, 10)._draft_probs_to_target_vocab(draft_probs)
+        self.assertIs(out, draft_probs)
+
+
 if __name__ == "__main__":
     unittest.main()
