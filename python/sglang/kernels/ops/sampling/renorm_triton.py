@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Union
+from typing import Optional, Union
 
 import torch
 import triton
@@ -103,21 +103,7 @@ def top_p_renorm_probs_triton(
     if batch_size == 0 or vocab_size == 0:
         return probs_fp32
 
-    if isinstance(top_p, torch.Tensor):
-        top_ps = top_p.to(device=probs.device, dtype=torch.float32).reshape(-1)
-        if top_ps.numel() == 1:
-            top_ps = top_ps.expand(batch_size)
-        elif top_ps.numel() != batch_size:
-            raise ValueError(
-                f"top_p must be scalar or have one value per row, got "
-                f"{top_ps.numel()} values for {batch_size} rows"
-            )
-    else:
-        if not 0.0 < float(top_p) <= 1.0:
-            raise ValueError("top_p values must be in (0, 1]")
-        top_ps = torch.full(
-            (batch_size,), float(top_p), device=probs.device, dtype=torch.float32
-        )
+    top_ps = _per_row_top_ps(top_p, batch_size, probs.device)
 
     # Match FlashInfer's threshold semantics: sort ascending, discard the prefix
     # whose cumulative mass is below 1 - p, and retain all ties at the pivot.
@@ -133,21 +119,94 @@ def top_p_renorm_probs_triton(
 
 
 def top_k_renorm_probs_triton(
-    probs: torch.Tensor, top_k: Union[torch.Tensor, int]
+    probs: torch.Tensor,
+    top_k: Union[torch.Tensor, int],
+    max_top_k: Optional[int] = None,
 ) -> torch.Tensor:
     """Apply exact top-k thresholding and renormalize each probability row.
 
     Sorting uses PyTorch's device kernels because a vocabulary-sized in-register
     Triton sort does not scale to 100K+ vocabularies. Triton performs the
     bandwidth-heavy masking, partial reduction, and normalization.
+
+    ``max_top_k``, a host-side bound on every row's top_k, replaces the sort with
+    a top-``max_top_k`` window; the k-th largest value, hence the output, is the
+    same.
     """
     probs_fp32 = _prepare_probs(probs)
     batch_size, vocab_size = probs_fp32.shape
     if batch_size == 0 or vocab_size == 0:
         return probs_fp32
 
+    top_ks = _per_row_top_ks(top_k, batch_size, probs.device)
+
+    # Match FlashInfer's threshold semantics: sort descending, keep the k highest
+    # probabilities, and retain all ties at the pivot.
+    window = _top_k_window(vocab_size, max_top_k)
+    if window < vocab_size:
+        sorted_probs = torch.topk(probs_fp32, window, dim=-1).values
+    else:
+        sorted_probs = torch.sort(probs_fp32, dim=-1, descending=True).values
+    cutoff = (top_ks - 1).clamp_(min=0, max=window - 1)
+    pivots = sorted_probs.gather(1, cutoff.unsqueeze(1)).squeeze(1).contiguous()
+
+    return _renorm_from_pivots(probs_fp32, pivots)
+
+
+def top_k_top_p_renorm_probs_triton(
+    probs: torch.Tensor,
+    top_k: Union[torch.Tensor, int],
+    top_p: Union[torch.Tensor, float],
+    max_top_k: int,
+) -> torch.Tensor:
+    """``top_p_renorm_probs_triton(top_k_renorm_probs_triton(probs, top_k), top_p)``
+    for a batch whose top_k values are all at most ``max_top_k``, without sorting
+    the vocabulary.
+
+    The k-th largest probability (the top-k pivot) comes from a top-``max_top_k``
+    window. After the top-k step every entry below that pivot is zero, and every
+    nonzero entry outside the window equals the pivot (a tie), so the ascending
+    CDF the top-p step thresholds is: those ties (counted with a row reduction),
+    then the window in ascending order. The pivots, and therefore the kept sets,
+    match the two sorting kernels; only the CDF's summation order differs.
+    """
+    probs_fp32 = _prepare_probs(probs)
+    batch_size, vocab_size = probs_fp32.shape
+    if batch_size == 0 or vocab_size == 0:
+        return probs_fp32
+    top_ks = _per_row_top_ks(top_k, batch_size, probs.device)
+    top_ps = _per_row_top_ps(top_p, batch_size, probs.device)
+    window = _top_k_window(vocab_size, max_top_k)
+
+    window_probs, window_ids = torch.topk(probs_fp32, window, dim=-1)
+    cutoff = (top_ks - 1).clamp_(min=0, max=window - 1).unsqueeze(1)
+    top_k_probs = _renorm_from_pivots(
+        probs_fp32, window_probs.gather(1, cutoff).squeeze(1).contiguous()
+    )
+
+    ascending = top_k_probs.gather(1, window_ids).flip(-1)
+    tie = top_k_probs.gather(1, window_ids.gather(1, cutoff)).squeeze(1)
+    ties_outside = (top_k_probs > 0).sum(dim=-1) - (ascending > 0).sum(dim=-1)
+    ties_mass = ties_outside.to(torch.float32) * tie
+    cdf = ties_mass.unsqueeze(1) + torch.cumsum(ascending, dim=-1)
+    threshold = 1.0 - top_ps
+    idx = torch.searchsorted(cdf, threshold.unsqueeze(1), right=False)
+    pivots = ascending.gather(1, idx.clamp_(max=window - 1)).squeeze(1)
+    in_ties = (ties_outside > 0) & (ties_mass >= threshold)
+    pivots = torch.where(in_ties, tie, pivots).contiguous()
+
+    return _renorm_from_pivots(top_k_probs, pivots)
+
+
+def _top_k_window(vocab_size: int, max_top_k: Optional[int]) -> int:
+    return vocab_size if max_top_k is None else max(1, min(max_top_k, vocab_size))
+
+
+def _per_row_top_ks(
+    top_k: Union[torch.Tensor, int], batch_size: int, device: torch.device
+) -> torch.Tensor:
     if isinstance(top_k, torch.Tensor):
-        top_ks = top_k.to(device=probs.device, dtype=torch.int64).reshape(-1)
+        top_ks = top_k.to(device=device, dtype=torch.int64).reshape(-1)
         if top_ks.numel() == 1:
             top_ks = top_ks.expand(batch_size)
         elif top_ks.numel() != batch_size:
@@ -155,18 +214,30 @@ def top_k_renorm_probs_triton(
                 f"top_k must be scalar or have one value per row, got "
                 f"{top_ks.numel()} values for {batch_size} rows"
             )
-    else:
-        top_ks = torch.full(
-            (batch_size,), int(top_k), device=probs.device, dtype=torch.int64
-        )
-
-    # Match FlashInfer's threshold semantics: sort descending, keep the k highest
-    # probabilities, and retain all ties at the pivot.
-    sorted_probs = torch.sort(probs_fp32, dim=-1, descending=True).values
-    cutoff = (top_ks - 1).clamp_(min=0, max=vocab_size - 1)
-    pivots = sorted_probs.gather(1, cutoff.unsqueeze(1)).squeeze(1).contiguous()
-
-    return _renorm_from_pivots(probs_fp32, pivots)
+        return top_ks
+    return torch.full((batch_size,), int(top_k), device=device, dtype=torch.int64)
 
 
-__all__ = ["top_k_renorm_probs_triton", "top_p_renorm_probs_triton"]
+def _per_row_top_ps(
+    top_p: Union[torch.Tensor, float], batch_size: int, device: torch.device
+) -> torch.Tensor:
+    if isinstance(top_p, torch.Tensor):
+        top_ps = top_p.to(device=device, dtype=torch.float32).reshape(-1)
+        if top_ps.numel() == 1:
+            top_ps = top_ps.expand(batch_size)
+        elif top_ps.numel() != batch_size:
+            raise ValueError(
+                f"top_p must be scalar or have one value per row, got "
+                f"{top_ps.numel()} values for {batch_size} rows"
+            )
+        return top_ps
+    if not 0.0 < float(top_p) <= 1.0:
+        raise ValueError("top_p values must be in (0, 1]")
+    return torch.full((batch_size,), float(top_p), device=device, dtype=torch.float32)
+
+
+__all__ = [
+    "top_k_renorm_probs_triton",
+    "top_k_top_p_renorm_probs_triton",
+    "top_p_renorm_probs_triton",
+]
