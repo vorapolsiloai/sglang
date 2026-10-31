@@ -17,7 +17,7 @@ from triton.language.extra.cuda import libdevice
 
 def _pdl_supported() -> bool:
     """Check if Programmatic Dependent Launch is supported (NVIDIA SM >= 90)."""
-    if not torch.cuda.is_available():
+    if not torch.cuda.is_available() or torch.version.hip:
         return False
     try:
         major, _ = torch.cuda.get_device_capability()
@@ -230,6 +230,9 @@ def fused_qk_gemma_rmsnorm_rope_gate(
         HAS_GATE=has_gate,
         MROPE=mrope,
         ENABLE_PDL=_ENABLE_PDL,
+        # One 64-lane wavefront per (token, head) on ROCm: twice as fast as the
+        # default 4 warps at prefill sizes on MI355X.
+        **({"num_warps": 1} if torch.version.hip else {}),
     )
 
     return q_out, k_out, gate_out if has_gate else None
