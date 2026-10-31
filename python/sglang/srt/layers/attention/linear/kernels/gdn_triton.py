@@ -231,7 +231,10 @@ class TritonGDNKernel(LinearAttnKernelBase):
             initial_state=recurrent_state,
             cu_seqlens=query_start_loc,
             head_first=False,
-            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            # The fused Qwen3.8 prologue hands over q and k already normalized.
+            use_qk_l2norm_in_kernel=(
+                use_qk_l2norm_in_kernel and not kwargs.get("qk_normalized", False)
+            ),
             **recurrent_state_indices_args,
             **inplace_update_args,
             **graph_table_args,
