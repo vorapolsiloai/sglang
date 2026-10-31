@@ -282,6 +282,7 @@ def chunk_fwd_o(
     chunk_indices: Optional[torch.LongTensor] = None,
     out: Optional[torch.Tensor] = None,
     output_indices: Optional[torch.Tensor] = None,
+    output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
@@ -297,7 +298,19 @@ def chunk_fwd_o(
     # The kernel writes every row of every sequence; only a padded batch's rows
     # past the last sequence need zeros, so they are cleared on their own instead
     # of zero-filling the whole output first. A caller-supplied `out` is left as is.
-    o = torch.empty_like(v) if out is None else out
+    # A caller's `output` buffer of the output's shape and dtype (e.g. a CUDA graph's
+    # static output) is written in place.
+    if out is not None:
+        o = out
+    elif (
+        output is not None
+        and output.shape == v.shape
+        and output.dtype == v.dtype
+        and output.is_contiguous()
+    ):
+        o = output
+    else:
+        o = torch.empty_like(v)
     if out is None and cu_seqlens is not None and T > 0:
         row = H * V
         _zero_rows_past_last_seq_kernel[(triton.cdiv(T, 16), triton.cdiv(row, 1024))](
