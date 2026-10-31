@@ -424,6 +424,54 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
                     f"{label}: padded rows wrote into the state pool",
                 )
 
+    def test_rows_past_last_sequence_are_zero(self):
+        """A padded batch's rows past cu_seqlens[-1] come out as zeros.
+
+        The output is not zero-filled up front; the rows past the last sequence
+        are cleared on their own, also when the allocator hands out blocks that
+        still hold NaNs.
+        """
+        device = get_device()
+        dtype = torch.bfloat16
+        B, T_per_seq, pad, H, K, V, pool_size = 3, 64, 40, 4, 128, 128, 8
+        T = B * T_per_seq
+        torch.manual_seed(0)
+
+        pool_init = (
+            torch.randn(pool_size, H, V, K, dtype=torch.float32, device=device) * 0.1
+        )
+        cache_indices = torch.arange(B, dtype=torch.int32, device=device)
+        cu_seqlens = torch.arange(0, T + 1, T_per_seq, dtype=torch.long, device=device)
+        q = torch.randn(1, T + pad, H, K, dtype=dtype, device=device)
+        k = torch.randn(1, T + pad, H, K, dtype=dtype, device=device)
+        v = torch.randn(1, T + pad, H, V, dtype=dtype, device=device)
+        g = torch.nn.functional.logsigmoid(
+            torch.randn(1, T + pad, H, dtype=dtype, device=device)
+        )
+        beta = torch.sigmoid(torch.randn(1, T + pad, H, dtype=dtype, device=device))
+
+        o_ref, _ = self._run_chunk(
+            pool_init,
+            cache_indices,
+            q[:, :T],
+            k[:, :T],
+            v[:, :T],
+            g[:, :T],
+            beta[:, :T],
+            cu_seqlens,
+        )
+        # Freed NaN blocks of the output's size, for the allocator to hand out next.
+        nan_blocks = [torch.full_like(v, float("nan")) for _ in range(8)]
+        del nan_blocks
+        o, _ = self._run_chunk(pool_init, cache_indices, q, k, v, g, beta, cu_seqlens)
+
+        self.assertTrue(torch.equal(o[:, T:], torch.zeros_like(o[:, T:])))
+        self.assertTrue(
+            torch.allclose(
+                o[:, :T].float(), o_ref.float(), atol=self.ATOL, rtol=self.RTOL
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
