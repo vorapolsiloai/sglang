@@ -28,6 +28,22 @@ def _launch_config() -> dict:
     return dict(BV=64, num_warps=4, num_stages=2)
 
 
+@triton.jit
+def _zero_rows_past_last_seq_kernel(
+    o, cu_seqlens, N, T, ROW: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr
+):
+    # Zero rows [cu_seqlens[N], T): a padded batch's rows past the last sequence,
+    # which chunk_fwd_kernel_o does not write.
+    i_t, i_c = tl.program_id(0), tl.program_id(1)
+    end = tl.load(cu_seqlens + N).to(tl.int32)
+    if (i_t + 1) * BLOCK_T > end:
+        rows = i_t * BLOCK_T + tl.arange(0, BLOCK_T)
+        cols = i_c * BLOCK_C + tl.arange(0, BLOCK_C)
+        mask = ((rows >= end) & (rows < T))[:, None] & (cols < ROW)[None, :]
+        offs = rows.to(tl.int64)[:, None] * ROW + cols[None, :]
+        tl.store(o + offs, tl.zeros([BLOCK_T, BLOCK_C], o.dtype.element_ty), mask=mask)
+
+
 # @triton.autotune(
 #     configs=[
 #         triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
@@ -278,7 +294,15 @@ def chunk_fwd_o(
 
     if (out is None) != (output_indices is None):
         raise ValueError("out and output_indices must be supplied together")
-    o = torch.zeros_like(v) if out is None else out
+    # The kernel writes every row of every sequence; only a padded batch's rows
+    # past the last sequence need zeros, so they are cleared on their own instead
+    # of zero-filling the whole output first. A caller-supplied `out` is left as is.
+    o = torch.empty_like(v) if out is None else out
+    if out is None and cu_seqlens is not None and T > 0:
+        row = H * V
+        _zero_rows_past_last_seq_kernel[(triton.cdiv(T, 16), triton.cdiv(row, 1024))](
+            o, cu_seqlens, len(cu_seqlens) - 1, T, ROW=row, BLOCK_T=16, BLOCK_C=1024
+        )
 
     use_grouped = output_indices is None and _use_grouped_three_head(
         q, k, v, h, g, cu_seqlens, chunk_size, NT
