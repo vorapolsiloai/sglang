@@ -4975,8 +4975,15 @@ class AiterIndicesUpdaterPrefill:
                 self.req_to_token.shape[1],
             )
 
-            token_num = kv_indptr[-1]
-            kv_indices[token_num:] = kv_indices[0]
+            # Pad after the last index with the first one. Compare on the
+            # device: slicing at kv_indptr[-1] reads it back, which stalls the
+            # CPU until the GPU drains, once per prefill.
+            positions = torch.arange(
+                kv_indices.numel(), dtype=torch.int32, device=kv_indices.device
+            )
+            kv_indices = torch.where(
+                positions < kv_indptr[-1], kv_indices, kv_indices[0]
+            )
 
             extend_lens = seq_lens - prefix_lens
 
