@@ -364,11 +364,11 @@ def chunk_gated_delta_rule(
         output (Optional[torch.Tensor]):
             Contiguous buffer of `v`'s shape and dtype, e.g. a CUDA graph's static
             output, to write the output into; `o` is then this tensor.
+            Default: `None` (a new tensor).
         epilogue (Optional[Callable]):
             Called as `epilogue(o, start, end)` on rows [start, end) of the output (`head_first=False`) once they are
             final, on the stream that wrote them, so the caller can consume finished rows while a pipelined scan
             continues; together the calls cover all rows. Default: `None`.
-            Default: `None` (a new tensor).
 
     Returns:
         o (torch.Tensor):
