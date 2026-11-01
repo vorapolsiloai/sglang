@@ -4,6 +4,10 @@ import unittest
 import torch
 
 from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
+from sglang.kernels.ops.attention.fla.chunk_fwd import (
+    chunk_gated_delta_rule_fwd_intra,
+)
+from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
 from sglang.kernels.ops.attention.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule,
 )
@@ -608,6 +612,48 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
                             o1[:, sum(lens) :], torch.zeros_like(o1[:, sum(lens) :])
                         )
                     )
+
+    def test_intra_takes_the_chunk_local_cumsum(self):
+        """With g_out, the fused kkt + solve kernel takes the raw gate and
+        writes its chunk-local cumsum; that cumsum, w, u and A are the same bits
+        as with chunk_local_cumsum first, also with a partial last chunk and
+        several sequences."""
+        device = get_device()
+        dtype = torch.bfloat16
+        Hg, H, K, V = 2, 6, 128, 128
+        torch.manual_seed(0)
+        for T, lens in ((4096, None), (4000, None), (5000, [1000, 37, 3963])):
+            with self.subTest(T=T, lens=lens):
+                cu_seqlens = None
+                if lens is not None:
+                    cu_seqlens = torch.tensor(
+                        [0] + torch.tensor(lens).cumsum(0).tolist(),
+                        dtype=torch.long,
+                        device=device,
+                    )
+                k = torch.nn.functional.normalize(
+                    torch.randn(1, T, Hg, K, dtype=torch.float32, device=device),
+                    dim=-1,
+                ).to(dtype)
+                v = torch.randn(1, T, H, V, dtype=dtype, device=device)
+                g = torch.nn.functional.logsigmoid(
+                    torch.randn(1, T, H, dtype=torch.float32, device=device)
+                )
+                beta = torch.sigmoid(
+                    torch.randn(1, T, H, dtype=torch.float32, device=device)
+                )
+                g_cumsum = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
+                w0, u0, A0 = chunk_gated_delta_rule_fwd_intra(
+                    k=k, v=v, g=g_cumsum, beta=beta, cu_seqlens=cu_seqlens
+                )
+                g_out = torch.full_like(g, float("nan"))
+                w1, u1, A1 = chunk_gated_delta_rule_fwd_intra(
+                    k=k, v=v, g=g, beta=beta, cu_seqlens=cu_seqlens, g_out=g_out
+                )
+                self.assertTrue(torch.equal(g_out, g_cumsum))
+                self.assertTrue(torch.equal(w1, w0))
+                self.assertTrue(torch.equal(u1, u0))
+                self.assertTrue(torch.equal(A1, A0))
 
     def test_host_offsets_are_bit_identical_without_syncs(self):
         """With cu_seqlens_cpu the scan plans from the host offsets instead of
