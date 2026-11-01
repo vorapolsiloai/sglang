@@ -45,6 +45,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
     supports_packed_decode: bool = not is_cpu() and not is_npu()
     supports_strided_target_verify_qkv: bool = True
     supports_fused_raw_qk_prefill: bool = True
+    supports_extend_epilogue: bool = not is_cpu() and not is_npu()
 
     def packed_decode(
         self,
@@ -207,6 +208,8 @@ class TritonGDNKernel(LinearAttnKernelBase):
                 "chunk_indices": kwargs["chunk_indices"],
                 "chunk_offsets": kwargs["chunk_offsets"],
             }
+        if kwargs.get("epilogue") is not None:
+            output_args["epilogue"] = kwargs["epilogue"]
         # The offsets on the host spare the chunk kernel reading them back.
         host_args = {"cu_seqlens_cpu": kwargs.get("query_start_loc_cpu")}
         if is_cpu():

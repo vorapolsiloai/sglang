@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 import triton
@@ -93,6 +93,7 @@ def chunk_gated_delta_rule_fwd_pipelined(
     seq_len: int,
     parts: int,
     output: Optional[torch.Tensor] = None,
+    epilogue: Optional[Callable[[torch.Tensor, int, int], None]] = None,
 ):
     """The chunk scan of one sequence (rows [0, seq_len) of the [1, T, ...]
     inputs) as `parts` runs of whole chunks over two streams.
@@ -105,6 +106,10 @@ def chunk_gated_delta_rule_fwd_pipelined(
     i - 1 while chunk_h does part i. The kernels and their per-chunk inputs are
     the same as in one pass, so the output, the per-chunk states and the final
     state are bit-identical.
+
+    `epilogue(o, start, end)` runs on rows [start, end) of the output once they
+    are final: on the side stream after each part's output, and for the last
+    part (with any rows past the sequence) on the calling stream after the scan.
     """
     T = q.shape[1]
     H, K, V = v.shape[-2], k.shape[-1], v.shape[-1]
@@ -152,6 +157,8 @@ def chunk_gated_delta_rule_fwd_pipelined(
             scale=scale,
             output=rows(o, i),
         )
+        if epilogue is not None:
+            epilogue(o, cuts[i], cuts[i + 1] if i + 1 < parts else T)
 
     main = torch.cuda.current_stream()
     side = _side_streams.get(q.device)
@@ -206,6 +213,7 @@ def chunk_gated_delta_rule_fwd(
     out: Optional[torch.Tensor] = None,
     output_indices: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
+    epilogue: Optional[Callable[[torch.Tensor, int, int], None]] = None,
     cu_seqlens_cpu: Optional[torch.LongTensor] = None,
 ):
     # The pipelined scan does not map its output through output_indices.
@@ -234,6 +242,7 @@ def chunk_gated_delta_rule_fwd(
             seq_len,
             parts,
             output=output,
+            epilogue=epilogue,
         )
     g = chunk_local_cumsum(
         g, chunk_size=CHUNK_SIZE, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
@@ -275,6 +284,8 @@ def chunk_gated_delta_rule_fwd(
         output_indices=output_indices,
         output=output,
     )
+    if epilogue is not None:
+        epilogue(o, 0, o.shape[1])
     if SUPPRESS_LEVEL < 3:
         return g, o, A, None, h, None
     elif SUPPRESS_LEVEL >= 3:
@@ -303,6 +314,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         out: Optional[torch.Tensor] = None,
         output_indices: Optional[torch.Tensor] = None,
         output: Optional[torch.Tensor] = None,
+        epilogue: Optional[Callable[[torch.Tensor, int, int], None]] = None,
         cu_seqlens_cpu: Optional[torch.LongTensor] = None,
     ):
         q_orig = q
@@ -337,6 +349,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             out=out,
             output_indices=output_indices,
             output=output,
+            epilogue=epilogue,
             cu_seqlens_cpu=cu_seqlens_cpu,
         )
         return o.to(q.dtype), h
@@ -361,6 +374,7 @@ def chunk_gated_delta_rule(
     out: Optional[torch.Tensor] = None,
     output_indices: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
+    epilogue: Optional[Callable[[torch.Tensor, int, int], None]] = None,
     cu_seqlens_cpu: Optional[torch.LongTensor] = None,
 ):
     r"""
@@ -399,6 +413,10 @@ def chunk_gated_delta_rule(
         output (Optional[torch.Tensor]):
             Contiguous buffer of `v`'s shape and dtype to write the output into (`head_first=False`); `o` is then
             this tensor. Default: `None` (a new tensor).
+        epilogue (Optional[Callable]):
+            Called as `epilogue(o, start, end)` on rows [start, end) of the output (`head_first=False`) once they are
+            final, on the stream that wrote them, so the caller can consume finished rows while a pipelined scan
+            continues; together the calls cover all rows. Default: `None`.
         cu_seqlens_cpu (Optional[torch.LongTensor]):
             `cu_seqlens` on the host. The kernels then plan from it instead of reading `cu_seqlens` back, which
             waits for the device. Default: `None`.
@@ -517,6 +535,7 @@ def chunk_gated_delta_rule(
         out,
         output_indices,
         output,
+        epilogue,
         cu_seqlens_cpu,
     )
     if head_first:

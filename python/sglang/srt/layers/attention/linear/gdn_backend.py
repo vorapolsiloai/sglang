@@ -484,6 +484,10 @@ class GDNKernelDispatcher:
     def extend_uses_state_checkpoints(self) -> bool:
         return self.extend_kernel.uses_state_checkpoints
 
+    @property
+    def extend_supports_epilogue(self) -> bool:
+        return self.extend_kernel.supports_extend_epilogue
+
     def packed_decode(
         self,
         mixed_qkv: torch.Tensor,
@@ -798,6 +802,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
             conv_len=self.conv_states_shape[-1],
             dst=forward_batch.mamba_track_indices,
         )
+
+    @property
+    def supports_extend_epilogue(self) -> bool:
+        """Whether forward_extend takes `linear_attn_epilogue`, called as
+        epilogue(o, start, end) on output rows once they are final."""
+        return self.kernel_dispatcher.extend_supports_epilogue
 
     def init_forward_metadata_out_graph(
         self,
@@ -1353,11 +1363,23 @@ class GDNAttnBackend(MambaAttnBackendBase):
             return mixed_qkv.new_zeros((1, 0, layer.num_v_heads, layer.head_v_dim))
 
         is_target_verify = forward_batch.forward_mode.is_target_verify()
+        epilogue = kwargs.get("linear_attn_epilogue")
         if self.prefill_graph_metadata is not None and not is_target_verify:
-            return self._forward_extend_in_graph(
+            core_attn_out = self._forward_extend_in_graph(
                 layer=layer, mixed_qkv=mixed_qkv, a=a, b=b
             )
+            if epilogue is not None:
+                # The captured chain runs the one-pass chunk scan, which has no
+                # per-part epilogue: run it over all rows once they are final.
+                epilogue(core_attn_out, 0, core_attn_out.shape[1])
+            return core_attn_out
         forward_metadata = self.forward_metadata
+        if epilogue is not None and (
+            is_target_verify
+            or self.mis_metadata is not None
+            or not self.kernel_dispatcher.extend_supports_epilogue
+        ):
+            raise ValueError("linear_attn_epilogue needs the chunked GDN extend")
 
         query_start_loc = forward_metadata.query_start_loc
         cache_indices = forward_metadata.mamba_cache_indices
@@ -1613,6 +1635,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     forward_metadata.state_checkpoint_every_n_tokens
                 ),
                 output=kwargs.get("linear_attn_output"),
+                epilogue=epilogue,
                 qk_normalized=prologue is not None,
                 layer_id=layer.layer_id,
                 extend_prefix_lens=forward_batch.extend_prefix_lens,
