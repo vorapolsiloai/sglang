@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 import triton
@@ -82,6 +82,7 @@ def chunk_gated_delta_rule_fwd_pipelined(
     seq_len: int,
     parts: int,
     output: Optional[torch.Tensor] = None,
+    epilogue: Optional[Callable[[torch.Tensor, int, int], None]] = None,
 ):
     """The chunk scan of one sequence (rows [0, seq_len) of the [1, T, ...]
     inputs) as `parts` runs of whole chunks over two streams.
@@ -94,6 +95,10 @@ def chunk_gated_delta_rule_fwd_pipelined(
     i - 1 while chunk_h does part i. The kernels and their per-chunk inputs are
     the same as in one pass, so the output, the per-chunk states and the final
     state are bit-identical.
+
+    `epilogue(o, start, end)` runs on rows [start, end) of the output once they
+    are final: on the side stream after each part's output, and for the last
+    part (with any rows past the sequence) on the calling stream after the scan.
     """
     T = q.shape[1]
     H, K, V = v.shape[-2], k.shape[-1], v.shape[-1]
@@ -135,6 +140,8 @@ def chunk_gated_delta_rule_fwd_pipelined(
             scale=scale,
             output=rows(o, i),
         )
+        if epilogue is not None:
+            epilogue(o, cuts[i], cuts[i + 1] if i + 1 < parts else T)
 
     main = torch.cuda.current_stream()
     side = _side_streams.get(q.device)
@@ -187,6 +194,7 @@ def chunk_gated_delta_rule_fwd(
     chunk_offsets: torch.LongTensor | None = None,
     o_chunk_indices: torch.LongTensor | None = None,
     output: Optional[torch.Tensor] = None,
+    epilogue: Optional[Callable[[torch.Tensor, int, int], None]] = None,
 ):
     parts, seq_len = _pipeline_plan(
         q, cu_seqlens, initial_state, initial_state_indices, inplace_update
@@ -204,6 +212,7 @@ def chunk_gated_delta_rule_fwd(
             seq_len,
             parts,
             output=output,
+            epilogue=epilogue,
         )
     g = chunk_local_cumsum(
         g, chunk_size=CHUNK_SIZE, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
@@ -242,6 +251,8 @@ def chunk_gated_delta_rule_fwd(
         chunk_indices=o_chunk_indices,
         output=output,
     )
+    if epilogue is not None:
+        epilogue(o, 0, o.shape[1])
     if SUPPRESS_LEVEL < 3:
         return g, o, A, None, h, None
     elif SUPPRESS_LEVEL >= 3:
@@ -268,6 +279,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         chunk_indices: Optional[torch.LongTensor] = None,
         chunk_offsets: Optional[torch.LongTensor] = None,
         output: Optional[torch.Tensor] = None,
+        epilogue: Optional[Callable[[torch.Tensor, int, int], None]] = None,
     ):
         q_orig = q
         k_orig = k
@@ -296,6 +308,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             chunk_offsets=chunk_offsets,
             o_chunk_indices=o_chunk_indices,
             output=output,
+            epilogue=epilogue,
         )
         return o.to(q.dtype), h
 
@@ -317,6 +330,7 @@ def chunk_gated_delta_rule(
     chunk_indices: Optional[torch.LongTensor] = None,
     chunk_offsets: Optional[torch.LongTensor] = None,
     output: Optional[torch.Tensor] = None,
+    epilogue: Optional[Callable[[torch.Tensor, int, int], None]] = None,
 ):
     r"""
     Args:
@@ -350,6 +364,10 @@ def chunk_gated_delta_rule(
         output (Optional[torch.Tensor]):
             Contiguous buffer of `v`'s shape and dtype, e.g. a CUDA graph's static
             output, to write the output into; `o` is then this tensor.
+        epilogue (Optional[Callable]):
+            Called as `epilogue(o, start, end)` on rows [start, end) of the output (`head_first=False`) once they are
+            final, on the stream that wrote them, so the caller can consume finished rows while a pipelined scan
+            continues; together the calls cover all rows. Default: `None`.
             Default: `None` (a new tensor).
 
     Returns:
@@ -441,6 +459,7 @@ def chunk_gated_delta_rule(
         chunk_indices,
         chunk_offsets,
         output,
+        epilogue,
     )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")
