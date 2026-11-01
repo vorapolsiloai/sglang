@@ -609,6 +609,34 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
                         )
                     )
 
+    @unittest.skipUnless(is_hip(), "the fence-free events are ROCm only")
+    def test_pipeline_events_order_the_two_streams(self):
+        """The pipelined scan's handoff events, created without the system-scope
+        fence on ROCm, still order the waiting stream's reads after the
+        recording stream's writes, also after the event pool wraps around."""
+        from sglang.kernels.ops.attention.fla import chunk as chunk_module
+
+        device = torch.device(get_device())
+        events = chunk_module._events_for(device)
+        self.assertIsInstance(events, chunk_module._HipEvents)
+        main = torch.cuda.current_stream()
+        side = torch.cuda.Stream(device=device)
+        busy = torch.randn(1024, 1024, device=device)
+        x = torch.zeros(1 << 22, device=device)
+        seen = torch.zeros(3 * events.POOL, 2, device=device)
+        for i in range(seen.shape[0]):
+            for _ in range(8):
+                busy = torch.tanh(busy @ busy)  # the write lands late
+            x.fill_(i)
+            events.wait(side, events.record(main))
+            with torch.cuda.stream(side):
+                seen[i, 0] = x.min()
+                seen[i, 1] = x.max()
+            events.wait(main, events.record(side))
+        expected = torch.arange(seen.shape[0], dtype=seen.dtype, device=device)
+        self.assertTrue(torch.equal(seen[:, 0], expected))
+        self.assertTrue(torch.equal(seen[:, 1], expected))
+
     def test_host_offsets_are_bit_identical_without_syncs(self):
         """With cu_seqlens_cpu the scan plans from the host offsets instead of
         reading cu_seqlens back: the same bits as without it, in one pass and

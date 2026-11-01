@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+import ctypes
 from typing import Callable, Optional
 
 import torch
@@ -20,6 +21,7 @@ from sglang.kernels.ops.attention.fla.utils import (
     SUPPRESS_LEVEL,
     autocast_custom_fwd,
     input_guard,
+    is_amd,
     is_intel,
     tensor_cache,
 )
@@ -40,6 +42,82 @@ PIPELINE_PART_TOKENS = 4096
 PIPELINE_MAX_PARTS = 4
 
 _side_streams = {}
+_stream_events = {}
+
+
+class _HipEvents:
+    """Events for the pipelined scan's handoffs between its two streams on ROCm,
+    created with hipEventDisableSystemFence. Both streams are on one GPU, where
+    each producing kernel's own release already orders its writes for the other
+    stream, so the system-scope fence at every record only adds command-processor
+    time on chunk_h's critical path. torch.cuda.Event cannot ask for the flag."""
+
+    FLAGS = 0x2 | 0x20000000  # hipEventDisableTiming | hipEventDisableSystemFence
+    # A scan records at most 8 events. A wait keeps the record it was queued
+    # behind, so an event can be recorded again while that wait is pending.
+    POOL = 32
+
+    def __init__(self):
+        from sglang.kernels.jit.utils.hipcc import hip_lib
+
+        hip = hip_lib()
+        hip.hipEventCreateWithFlags.restype = ctypes.c_int
+        hip.hipEventCreateWithFlags.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_uint,
+        ]
+        hip.hipEventRecord.restype = ctypes.c_int
+        hip.hipEventRecord.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        hip.hipStreamWaitEvent.restype = ctypes.c_int
+        hip.hipStreamWaitEvent.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint,
+        ]
+        self.hip, self.events, self.next = hip, [], 0
+        for _ in range(self.POOL):
+            event = ctypes.c_void_p()
+            _check_hip(
+                hip.hipEventCreateWithFlags(ctypes.byref(event), self.FLAGS),
+                "hipEventCreateWithFlags",
+            )
+            self.events.append(event)
+
+    def record(self, stream):
+        event = self.events[self.next]
+        self.next = (self.next + 1) % self.POOL
+        _check_hip(
+            self.hip.hipEventRecord(event, ctypes.c_void_p(stream.cuda_stream)),
+            "hipEventRecord",
+        )
+        return event
+
+    def wait(self, stream, event):
+        _check_hip(
+            self.hip.hipStreamWaitEvent(ctypes.c_void_p(stream.cuda_stream), event, 0),
+            "hipStreamWaitEvent",
+        )
+
+
+def _check_hip(rc, what):
+    if rc != 0:
+        raise RuntimeError(f"{what} failed: {rc}")
+
+
+class _TorchEvents:
+    def record(self, stream):
+        return stream.record_event()
+
+    def wait(self, stream, event):
+        stream.wait_event(event)
+
+
+def _events_for(device):
+    events = _stream_events.get(device)
+    if events is None:
+        events = _HipEvents() if is_amd else _TorchEvents()
+        _stream_events[device] = events
+    return events
 
 
 @tensor_cache
@@ -158,7 +236,8 @@ def chunk_gated_delta_rule_fwd_pipelined(
     side = _side_streams.get(q.device)
     if side is None:
         side = _side_streams[q.device] = torch.cuda.Stream(device=q.device)
-    side.wait_stream(main)
+    events = _events_for(q.device)
+    events.wait(side, events.record(main))
     wu = [intra(0)] + [None] * (parts - 1)
     wu_done = [None] * parts
     v_new = [None] * parts
@@ -167,12 +246,12 @@ def chunk_gated_delta_rule_fwd_pipelined(
         with torch.cuda.stream(side):
             if i + 1 < parts:
                 wu[i + 1] = intra(i + 1)
-                wu_done[i + 1] = side.record_event()
+                wu_done[i + 1] = events.record(side)
             if i > 0:
-                side.wait_event(h_done[i - 1])
+                events.wait(side, h_done[i - 1])
                 out(i - 1, v_new[i - 1])
         if i > 0:
-            main.wait_event(wu_done[i])
+            events.wait(main, wu_done[i])
         w, u = wu[i]
         _, v_new[i] = chunk_gated_delta_rule_fwd_h(
             k=rows(k, i),
@@ -184,9 +263,11 @@ def chunk_gated_delta_rule_fwd_pipelined(
             inplace_update=True,
             h=chunks(i),
         )
-        h_done[i] = main.record_event()
+        if i + 1 < parts:
+            # The last part's output runs on this stream: nothing waits for it.
+            h_done[i] = events.record(main)
     out(parts - 1, v_new[parts - 1])
-    main.wait_stream(side)
+    events.wait(main, events.record(side))
     return g, o, None, None, h, None
 
 
