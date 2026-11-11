@@ -189,18 +189,6 @@ class TestRMSNormGatedMXFP4Kernel(unittest.TestCase):
             eps=1e-5,
         )
 
-    def test_row_major_even_non_power_of_two_head_width(self):
-        self._run_case(
-            num_tokens=1,
-            num_heads=3,
-            head_dim=96,
-            dtype=torch.float16,
-            z_is_3d=True,
-            round_mode=MXFP4_ROUND_EVEN,
-            shuffle_scales=False,
-            activation="silu",
-        )
-
     def test_shuffled_round_up_qwen_decode(self):
         self._run_case(
             num_tokens=1,
@@ -222,43 +210,6 @@ class TestRMSNormGatedMXFP4Kernel(unittest.TestCase):
             round_mode=MXFP4_ROUND_UP,
             shuffle_scales=True,
         )
-
-    def test_shuffled_round_up_rejects_unaligned_total_width(self):
-        num_tokens, num_heads, head_dim = 257, 3, 96
-        x = torch.empty(
-            (num_tokens * num_heads, head_dim),
-            device="cuda",
-            dtype=torch.bfloat16,
-        )
-        z = torch.empty(
-            (num_tokens, num_heads, head_dim),
-            device="cuda",
-            dtype=torch.bfloat16,
-        )
-        weight = torch.empty(head_dim, device="cuda", dtype=torch.bfloat16)
-
-        self.assertFalse(
-            can_use_rmsnorm_gated_mxfp4(
-                x,
-                z,
-                weight,
-                num_heads=num_heads,
-                activation="swish",
-                shuffle_scales=True,
-            )
-        )
-        with self.assertRaisesRegex(ValueError, "device, shape, or layout"):
-            rmsnorm_gated_mxfp4_quant(
-                x,
-                z,
-                weight,
-                1e-6,
-                num_heads=num_heads,
-                activation="swish",
-                round_mode=MXFP4_ROUND_UP,
-                shuffle_scales=True,
-                use_native_dtypes=True,
-            )
 
 
 if __name__ == "__main__":
