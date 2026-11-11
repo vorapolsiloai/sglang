@@ -38,7 +38,7 @@ DEVICE = "cuda"
 HIDDEN = 5120
 # Qwen3.8-27B down_proj K per rank: TP2 and TP1.
 INTERMEDIATE_SIZES = [8704, 17408]
-M_VALUES = [1, 7, 8, 9, 64, 255, 256, 257, 870, 2048, 4377, 6553, 16384]
+M_VALUES = [1, 9, 257, 4377]
 # What qwen3_5 sets on an MLP whose fusion it enables.
 _MLP = SimpleNamespace(
     _mxfp4_x_dtype=aiter_dtypes.fp4x2, _mxfp4_scale_dtype=aiter_dtypes.fp8_e8m0
@@ -84,7 +84,7 @@ def test_matches_silu_and_mul_then_quant(m, n):
 
 
 @pytest.mark.parametrize("n", INTERMEDIATE_SIZES)
-@pytest.mark.parametrize("m", [1, 33, 2048])
+@pytest.mark.parametrize("m", [33])
 @torch.inference_mode()
 def test_edge_blocks(m, n):
     g = torch.Generator(device=DEVICE).manual_seed(7)

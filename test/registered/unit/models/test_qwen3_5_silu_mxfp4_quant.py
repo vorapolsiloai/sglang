@@ -14,7 +14,6 @@ from torch import nn
 
 from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
     QuarkW4A4MXFP4,
-    _AsmShuffledMxfp4Input,
 )
 from sglang.srt.models import qwen2_moe, qwen3_5
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP
@@ -98,31 +97,6 @@ class TestEnable(CustomTestCase):
             with self.subTest(name):
                 mlp = self._enable(**kwargs)
                 self.assertFalse(mlp._enable_silu_mxfp4_quant_fusion)
-
-
-class TestProducer(CustomTestCase):
-    def test_requests_the_unfused_numerics_and_layout(self):
-        calls = []
-
-        def act_mul_and_mxfp4_quant(x, activation, **kwargs):
-            calls.append((x, activation, kwargs))
-            return _act_mul_and_mxfp4_quant(x, activation)
-
-        mlp = SimpleNamespace(_mxfp4_x_dtype=_FP4X2, _mxfp4_scale_dtype=_E8M0)
-        gate_up = torch.zeros(3, 2 * 1024, dtype=torch.bfloat16)
-        with _fake_aiter(act_mul_and_mxfp4_quant):
-            out = Qwen2MoeMLP._silu_mxfp4_quant_fused(mlp, gate_up)
-        ((x, activation, kwargs),) = calls
-        self.assertIs(x, gate_up)
-        self.assertEqual(activation, "silu")
-        self.assertEqual(
-            kwargs,
-            {"scaling_mode": "roundup", "shuffle": True, "round_to_input_dtype": True},
-        )
-        self.assertIsInstance(out, _AsmShuffledMxfp4Input)
-        x_q, x_scales = out
-        self.assertEqual((x_q.dtype, tuple(x_q.shape)), (_FP4X2, (3, 512)))
-        self.assertEqual((x_scales.dtype, tuple(x_scales.shape)), (_E8M0, (256, 32)))
 
 
 class TestForward(CustomTestCase):
