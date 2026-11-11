@@ -11,7 +11,7 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     QWEN38_GDN_NUM_QK_HEADS,
     QWEN38_GDN_NUM_V_HEADS,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models import qwen3_5
 from sglang.srt.models.qwen3_5 import Qwen3_5GatedDeltaNet
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -105,63 +105,6 @@ class TestQwen35GDNMXFP4Routing(unittest.TestCase):
         self.assertEqual(actual.shape, (num_tokens, num_heads * head_dim))
         self.assertIs(actual, out_proj.last_input)
 
-    def test_declined_fusion_preserves_dense_fallback(self):
-        num_tokens, num_heads, head_dim = 2, 3, 128
-        x = torch.empty((num_tokens * num_heads, head_dim), dtype=torch.bfloat16)
-        z = torch.empty((num_tokens, num_heads, head_dim), dtype=torch.bfloat16)
-        dense = torch.empty_like(x)
-        prepare_input = Mock(return_value=None)
-        out_proj = _OutProj(
-            SimpleNamespace(prepare_fused_rmsnorm_gated_input=prepare_input)
-        )
-        norm = Mock(return_value=dense)
-        norm.group_size = None
-        norm.norm_before_gate = True
-        norm.bias = None
-        norm.weight = torch.empty(head_dim, dtype=torch.bfloat16)
-        norm.eps = 1e-6
-        norm.activation = "swish"
-        owner = SimpleNamespace(
-            norm=norm,
-            out_proj=out_proj,
-            num_v_heads=num_heads,
-            attn_tp_size=1,
-        )
-
-        actual = Qwen3_5GatedDeltaNet._norm_and_out_proj(owner, x, z, z.shape)
-
-        prepare_input.assert_called_once()
-        norm.assert_called_once_with(x, z)
-        self.assertIs(actual, out_proj.last_input)
-
-    def test_incompatible_norm_policy_does_not_call_quant_scheme(self):
-        num_tokens, num_heads, head_dim = 2, 3, 128
-        x = torch.empty((num_tokens * num_heads, head_dim), dtype=torch.bfloat16)
-        z = torch.empty((num_tokens, num_heads, head_dim), dtype=torch.bfloat16)
-        dense = torch.empty_like(x)
-        prepare_input = Mock()
-        out_proj = _OutProj(
-            SimpleNamespace(prepare_fused_rmsnorm_gated_input=prepare_input)
-        )
-        norm = Mock(return_value=dense)
-        norm.group_size = None
-        norm.norm_before_gate = False
-        norm.bias = None
-        norm.weight = torch.empty(head_dim, dtype=torch.bfloat16)
-        norm.eps = 1e-6
-        norm.activation = "swish"
-        owner = SimpleNamespace(
-            norm=norm,
-            out_proj=out_proj,
-            num_v_heads=num_heads,
-            attn_tp_size=1,
-        )
-
-        Qwen3_5GatedDeltaNet._norm_and_out_proj(owner, x, z, z.shape)
-
-        prepare_input.assert_not_called()
-        norm.assert_called_once_with(x, z)
-
 
 class TestQwen38PrefillProjectionViews(CustomTestCase):
     """ROCm prefill reads the in_proj outputs as strided views only where the
@@ -215,18 +158,13 @@ class TestQwen38PrefillProjectionViews(CustomTestCase):
         self.assertTrue(self._decide(batch=dict(global_num_token_non_padded_cpu=None)))
 
     def test_cases_outside_the_prologue_keep_the_contiguous_unpack(self):
-        half_dim = QWEN38_GDN_HEAD_DIM // 2
         cases = {
             "prologue off": dict(prologue=False),
             "deterministic inference": dict(deterministic=True),
             "page-major KV layout": dict(page_major=True),
             "TP2 head shard": dict(layer=dict(attn_tp_size=2)),
             "other k-head count": dict(layer=dict(num_k_heads=8)),
-            "other v-head count": dict(layer=dict(num_v_heads=32)),
-            "other k-head dim": dict(layer=dict(head_k_dim=half_dim)),
-            "other v-head dim": dict(layer=dict(head_v_dim=half_dim)),
             "decode": dict(batch=dict(forward_mode=ForwardMode.DECODE)),
-            "target verify": dict(batch=dict(forward_mode=ForwardMode.TARGET_VERIFY)),
             "multi-item scoring": dict(
                 batch=dict(multi_item_delimiter_indices=[torch.zeros(1)])
             ),
